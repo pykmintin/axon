@@ -96,6 +96,9 @@ class TestStorageBackend:
             def remove_nodes_by_file(self, file_path):
                 return 0
 
+            def get_inbound_cross_file_edges(self, file_path, exclude_source_files=None):
+                return []
+
             def get_node(self, node_id):
                 return None
 
