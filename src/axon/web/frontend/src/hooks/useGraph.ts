@@ -52,16 +52,7 @@ export function useGraph(): UseGraphReturn {
 
         setGraphData(graphData.nodes, graphData.edges);
 
-        // The API returns { totalNodes, totalEdges } but the store expects
-        // { totals: { nodes, edges } }. Map the shape here.
-        setOverview({
-          nodesByLabel: overview.nodesByLabel,
-          edgesByType: overview.edgesByType,
-          totals: {
-            nodes: overview.totalNodes,
-            edges: overview.totalEdges,
-          },
-        });
+        setOverview(overview);
       } catch (e) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : 'Failed to load graph');

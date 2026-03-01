@@ -513,11 +513,8 @@ class TestCommunitiesEndpoint:
     def test_communities_with_data(
         self, mock_storage: MagicMock, client: TestClient
     ) -> None:
-        # First call: community list, then member query, then cohesion query
-        mock_storage.execute_raw.side_effect = [
-            [["community:auth", "Auth Module"]],  # communities
-            [["func:login"], ["func:register"]],   # members
-            [[0.85]],                               # cohesion
+        mock_storage.execute_raw.return_value = [
+            ["community:auth", "Auth Module", 0.85, ["func:login", "func:register"]],
         ]
 
         response = client.get("/communities")
@@ -550,11 +547,9 @@ class TestProcessesEndpoint:
     def test_processes_with_data(
         self, mock_storage: MagicMock, client: TestClient
     ) -> None:
-        # First call: process list, then steps, then kind
-        mock_storage.execute_raw.side_effect = [
-            [["process:login-flow", "Login Flow"]],   # processes
-            [["func:validate", 1], ["func:auth", 2]], # steps
-            [["http"]],                                 # kind
+        mock_storage.execute_raw.return_value = [
+            ["process:login-flow", "Login Flow", "http",
+             ["func:validate", "func:auth"], [1, 2]],
         ]
 
         response = client.get("/processes")

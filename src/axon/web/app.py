@@ -82,14 +82,14 @@ def create_app(
     from axon.web.routes.processes import router as processes_router
     from axon.web.routes.search import router as search_router
 
-    app.include_router(graph_router)
-    app.include_router(search_router)
-    app.include_router(analysis_router)
-    app.include_router(files_router)
-    app.include_router(cypher_router)
-    app.include_router(diff_router)
-    app.include_router(processes_router)
-    app.include_router(events_router)
+    app.include_router(graph_router, prefix="/api")
+    app.include_router(search_router, prefix="/api")
+    app.include_router(analysis_router, prefix="/api")
+    app.include_router(files_router, prefix="/api")
+    app.include_router(cypher_router, prefix="/api")
+    app.include_router(diff_router, prefix="/api")
+    app.include_router(processes_router, prefix="/api")
+    app.include_router(events_router, prefix="/api")
 
     if not dev and FRONTEND_DIR.is_dir():
         app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")

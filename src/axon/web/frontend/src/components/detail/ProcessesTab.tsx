@@ -1,40 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { analysisApi } from '@/api/client';
 import { useDataStore } from '@/stores/dataStore';
 import { useGraphStore } from '@/stores/graphStore';
 import type { Process } from '@/types';
 import { ChevronDown, ChevronRight, Route, Highlighter } from 'lucide-react';
-
-// ---------------------------------------------------------------------------
-// Type badge (reused pattern)
-// ---------------------------------------------------------------------------
-
-const TYPE_BADGE: Record<string, { symbol: string; color: string }> = {
-  function: { symbol: '\u0192', color: 'var(--node-function)' },
-  class: { symbol: 'C', color: 'var(--node-class)' },
-  method: { symbol: 'M', color: 'var(--node-method)' },
-  interface: { symbol: 'I', color: 'var(--node-interface)' },
-  type_alias: { symbol: 'T', color: 'var(--node-typealias)' },
-  enum: { symbol: 'E', color: 'var(--node-enum)' },
-};
-
-function TypeBadge({ label }: { label: string }) {
-  const badge = TYPE_BADGE[label] ?? { symbol: '?', color: 'var(--text-secondary)' };
-  return (
-    <span
-      style={{
-        color: badge.color,
-        fontFamily: "'JetBrains Mono', monospace",
-        fontWeight: 700,
-        fontSize: 12,
-        marginRight: 4,
-        flexShrink: 0,
-      }}
-    >
-      {badge.symbol}
-    </span>
-  );
-}
+import { TypeBadge } from '@/components/shared/TypeBadge';
+import { shortPath } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Kind badge
@@ -263,15 +234,6 @@ function StepRow({
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function shortPath(filePath: string): string {
-  const parts = filePath.split('/');
-  return parts[parts.length - 1] ?? filePath;
-}
-
-// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -289,10 +251,13 @@ export function ProcessesTab({ nodeId }: ProcessesTabProps) {
   const [error, setError] = useState<string | null>(null);
 
   // Build a quick-lookup map from graphStore nodes
-  const nodeMap = new Map<string, { name: string; label: string; filePath: string; startLine: number }>();
-  for (const n of graphNodes) {
-    nodeMap.set(n.id, { name: n.name, label: n.label, filePath: n.filePath, startLine: n.startLine });
-  }
+  const nodeMap = useMemo(() => {
+    const map = new Map<string, { name: string; label: string; filePath: string; startLine: number }>();
+    for (const n of graphNodes) {
+      map.set(n.id, { name: n.name, label: n.label, filePath: n.filePath, startLine: n.startLine });
+    }
+    return map;
+  }, [graphNodes]);
 
   // Fetch all processes if not already loaded
   const fetchProcesses = useCallback(async () => {
@@ -314,12 +279,16 @@ export function ProcessesTab({ nodeId }: ProcessesTabProps) {
   }, [fetchProcesses]);
 
   // Filter processes that involve the selected node
-  const relevantProcesses = (allProcesses ?? []).filter((p: Process) =>
-    p.steps.some((s) => s.nodeId === nodeId),
-  );
-
-  const crossProcesses = relevantProcesses.filter((p: Process) => p.kind === 'cross');
-  const intraProcesses = relevantProcesses.filter((p: Process) => p.kind !== 'cross');
+  const { relevantProcesses, crossProcesses, intraProcesses } = useMemo(() => {
+    const relevant = (allProcesses ?? []).filter((p: Process) =>
+      p.steps.some((s) => s.nodeId === nodeId),
+    );
+    return {
+      relevantProcesses: relevant,
+      crossProcesses: relevant.filter((p: Process) => p.kind === 'cross'),
+      intraProcesses: relevant.filter((p: Process) => p.kind !== 'cross'),
+    };
+  }, [allProcesses, nodeId]);
 
   if (loading['processes']) {
     return (

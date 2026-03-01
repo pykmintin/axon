@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CouplingPair } from '@/types';
 
 interface CouplingHeatmapProps {
@@ -35,7 +35,7 @@ export function CouplingHeatmap({ pairs }: CouplingHeatmapProps) {
   const [truncated, setTruncated] = useState(false);
 
   // Build matrix data
-  const { files, matrix, pairMap } = buildMatrix(pairs);
+  const { files, matrix, pairMap } = useMemo(() => buildMatrix(pairs), [pairs]);
 
   // Track truncation
   useEffect(() => {

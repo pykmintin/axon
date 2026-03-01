@@ -3,47 +3,8 @@ import { diffApi } from '@/api/client';
 import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore } from '@/stores/viewStore';
 import type { DiffResult, GraphNode, ModifiedNodePair } from '@/types';
-
-function TypeBadge({ label }: { label: string }) {
-  const key = label.toLowerCase();
-  const abbrevMap: Record<string, string> = {
-    function: '\u0192',
-    class: 'C',
-    method: 'M',
-    interface: 'I',
-    type_alias: 'T',
-    enum: 'E',
-  };
-  const colorMap: Record<string, string> = {
-    function: 'var(--node-function)',
-    class: 'var(--node-class)',
-    method: 'var(--node-method)',
-    interface: 'var(--node-interface)',
-    type_alias: 'var(--node-typealias)',
-    enum: 'var(--node-enum)',
-  };
-
-  return (
-    <span
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        width: 16,
-        height: 16,
-        fontSize: 10,
-        fontWeight: 700,
-        fontFamily: "'JetBrains Mono', monospace",
-        color: colorMap[key] ?? 'var(--text-secondary)',
-        background: 'var(--bg-primary)',
-        borderRadius: 'var(--radius)',
-        flexShrink: 0,
-      }}
-    >
-      {abbrevMap[key] ?? label.charAt(0).toUpperCase()}
-    </span>
-  );
-}
+import { TypeBadge } from '@/components/shared/TypeBadge';
+import { shortPath } from '@/lib/utils';
 
 function NodeRow({
   node,
@@ -326,12 +287,6 @@ export function BranchDiff() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function shortPath(filePath: string): string {
-  const parts = filePath.split('/');
-  if (parts.length <= 2) return filePath;
-  return parts.slice(-2).join('/');
-}
 
 function Section({
   title,

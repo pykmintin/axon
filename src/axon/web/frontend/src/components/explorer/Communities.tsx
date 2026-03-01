@@ -3,6 +3,7 @@ import { ChevronRight, ChevronDown } from 'lucide-react';
 import { analysisApi } from '@/api/client';
 import { useGraphStore } from '@/stores/graphStore';
 import type { Community } from '@/types';
+import { TypeBadge } from '@/components/shared/TypeBadge';
 
 // 12 distinct community colors, cycled for each community.
 const COMMUNITY_COLORS = [
@@ -306,36 +307,3 @@ function MemberRow({ member }: { member: { id: string; name: string; label: stri
   );
 }
 
-function TypeBadge({ label }: { label: string }) {
-  const colorMap: Record<string, string> = {
-    function: 'var(--node-function)',
-    class: 'var(--node-class)',
-    method: 'var(--node-method)',
-    interface: 'var(--node-interface)',
-    type_alias: 'var(--node-typealias)',
-    enum: 'var(--node-enum)',
-  };
-  const abbrevMap: Record<string, string> = {
-    function: '\u0192',
-    class: 'C',
-    method: 'M',
-    interface: 'I',
-    type_alias: 'T',
-    enum: 'E',
-  };
-  const key = label.toLowerCase();
-  return (
-    <span
-      style={{
-        color: colorMap[key] ?? 'var(--text-secondary)',
-        fontWeight: 600,
-        fontSize: 9,
-        width: 12,
-        textAlign: 'center',
-        flexShrink: 0,
-      }}
-    >
-      {abbrevMap[key] ?? label.charAt(0).toUpperCase()}
-    </span>
-  );
-}

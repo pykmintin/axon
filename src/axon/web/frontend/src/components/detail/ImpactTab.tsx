@@ -5,37 +5,8 @@ import { useGraphStore } from '@/stores/graphStore';
 import type { ImpactResult, GraphNode } from '@/types';
 import { ChevronDown, ChevronRight, Radar } from 'lucide-react';
 import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
-
-// ---------------------------------------------------------------------------
-// Type badge (reused pattern)
-// ---------------------------------------------------------------------------
-
-const TYPE_BADGE: Record<string, { symbol: string; color: string }> = {
-  function: { symbol: '\u0192', color: 'var(--node-function)' },
-  class: { symbol: 'C', color: 'var(--node-class)' },
-  method: { symbol: 'M', color: 'var(--node-method)' },
-  interface: { symbol: 'I', color: 'var(--node-interface)' },
-  type_alias: { symbol: 'T', color: 'var(--node-typealias)' },
-  enum: { symbol: 'E', color: 'var(--node-enum)' },
-};
-
-function TypeBadge({ label }: { label: string }) {
-  const badge = TYPE_BADGE[label] ?? { symbol: '?', color: 'var(--text-secondary)' };
-  return (
-    <span
-      style={{
-        color: badge.color,
-        fontFamily: "'JetBrains Mono', monospace",
-        fontWeight: 700,
-        fontSize: 12,
-        marginRight: 4,
-        flexShrink: 0,
-      }}
-    >
-      {badge.symbol}
-    </span>
-  );
-}
+import { TypeBadge } from '@/components/shared/TypeBadge';
+import { shortPath } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Depth section styling
@@ -158,15 +129,6 @@ function DepthSection({
       )}
     </div>
   );
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function shortPath(filePath: string): string {
-  const parts = filePath.split('/');
-  return parts[parts.length - 1] ?? filePath;
 }
 
 // ---------------------------------------------------------------------------

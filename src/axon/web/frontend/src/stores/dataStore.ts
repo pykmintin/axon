@@ -4,19 +4,11 @@ import type {
   CypherEntry,
   CypherResult,
   DeadCodeReport,
-  GraphNode,
   HealthScore,
   ImpactResult,
+  NodeContext,
   Process,
 } from '@/types';
-
-export interface NodeContext {
-  node: GraphNode;
-  callers: Array<{ node: GraphNode; confidence: number }>;
-  callees: Array<{ node: GraphNode; confidence: number }>;
-  typeRefs: GraphNode[];
-  processes: string[];
-}
 
 interface DataStore {
   // Node detail

@@ -15,8 +15,8 @@ export function Header() {
   const setActiveView = useViewStore((s) => s.setActiveView);
   const toggleCommandPalette = useViewStore((s) => s.toggleCommandPalette);
 
-  const nodeCount = overview?.totals.nodes ?? 0;
-  const edgeCount = overview?.totals.edges ?? 0;
+  const nodeCount = overview?.totalNodes ?? 0;
+  const edgeCount = overview?.totalEdges ?? 0;
 
   return (
     <header

@@ -17,48 +17,26 @@ def get_processes(request: Request) -> dict:
     storage = request.app.state.storage
 
     try:
-        process_rows = storage.execute_raw(
-            "MATCH (p) WHERE labels(p) = 'Process' RETURN p.id, p.name"
+        rows = storage.execute_raw(
+            "MATCH (p) WHERE labels(p) = 'Process' "
+            "OPTIONAL MATCH (n)-[r]->(p) WHERE r.rel_type = 'step_in_process' "
+            "RETURN p.id, p.name, p.kind, collect(n.id), collect(r.step_number) "
+            "ORDER BY p.name"
         )
     except Exception as exc:
         logger.error("Processes query failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Processes query failed") from exc
 
-    if not process_rows:
+    if not rows:
         return {"processes": []}
 
     processes = []
-    for row in process_rows:
-        pid = row[0] if row else ""
-        pname = row[1] if len(row) > 1 else ""
-
-        try:
-            step_rows = storage.execute_raw(
-                f"MATCH (n)-[r]->(p) WHERE p.id = '{pid}' "
-                f"AND r.rel_type = 'step_in_process' "
-                f"RETURN n.id, r.step_number "
-                f"ORDER BY r.step_number"
-            )
-        except Exception:
-            step_rows = []
-
-        steps = []
-        for step_row in step_rows or []:
-            steps.append({
-                "nodeId": step_row[0] if step_row else "",
-                "stepNumber": step_row[1] if len(step_row) > 1 else 0,
-            })
-
-        kind = None
-        try:
-            kind_rows = storage.execute_raw(
-                f"MATCH (p) WHERE p.id = '{pid}' RETURN p.kind"
-            )
-            if kind_rows and kind_rows[0] and kind_rows[0][0]:
-                kind = kind_rows[0][0]
-        except Exception:
-            pass
-
+    for row in rows:
+        _, pname, kind, node_ids, step_numbers = row
+        steps = sorted(
+            [{"nodeId": nid, "stepNumber": sn} for nid, sn in zip(node_ids or [], step_numbers or [])],
+            key=lambda s: s["stepNumber"],
+        )
         processes.append({
             "name": pname,
             "kind": kind,

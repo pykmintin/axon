@@ -8,22 +8,27 @@
 import { MultiDirectedGraph } from 'graphology';
 import type { GraphNode, GraphEdge, NodeLabel } from '@/types';
 
-/** Color palette for each node label. Maps to CSS variable equivalents. */
-const NODE_COLORS: Record<string, string> = {
-  function: '#39d353',
-  class: '#58a6ff',
-  method: '#a371f7',
-  interface: '#3fb8af',
-  type_alias: '#56d4dd',
-  enum: '#f0883e',
-  file: '#6b7d8e',
-  folder: '#4d5969',
-  community: '#a371f7',
-  process: '#3fb8af',
+/**
+ * Muted color palette tuned for dark backgrounds.
+ * Lower saturation + moderate lightness = readable without visual noise.
+ * Each color has a matching border tone (slightly brighter) set as `borderColor`.
+ */
+const NODE_COLORS: Record<string, { fill: string; border: string }> = {
+  function: { fill: '#2a9d47', border: '#3dbf5a' },
+  class:    { fill: '#4488cc', border: '#5599dd' },
+  method:   { fill: '#8866bb', border: '#9977cc' },
+  interface:{ fill: '#3a9a90', border: '#4db3a8' },
+  type_alias:{ fill: '#4a9eaa', border: '#5cb3be' },
+  enum:     { fill: '#c07830', border: '#d48a42' },
+  file:     { fill: '#4a5a6a', border: '#5a6a7a' },
+  folder:   { fill: '#3a4550', border: '#4a5560' },
+  community:{ fill: '#7755aa', border: '#8866bb' },
+  process:  { fill: '#3a9a90', border: '#4db3a8' },
 };
 
-const DEFAULT_NODE_COLOR = '#6b7d8e';
-const DEFAULT_EDGE_COLOR = '#3d4f5f';
+const DEFAULT_NODE_FILL = '#4a5a6a';
+const DEFAULT_NODE_BORDER = '#5a6a7a';
+const DEFAULT_EDGE_COLOR = '#1e2a36';
 
 /**
  * Build a Graphology MultiDirectedGraph from raw API node/edge arrays.
@@ -42,12 +47,14 @@ export function buildGraphology(nodes: GraphNode[], edges: GraphEdge[]): MultiDi
   const graph = new MultiDirectedGraph();
 
   for (const node of nodes) {
+    const palette = NODE_COLORS[node.label] ?? { fill: DEFAULT_NODE_FILL, border: DEFAULT_NODE_BORDER };
     graph.addNode(node.id, {
       label: node.name,
       x: Math.random() * 1000,
       y: Math.random() * 1000,
-      size: 4,
-      color: NODE_COLORS[node.label] ?? DEFAULT_NODE_COLOR,
+      size: 3,
+      color: palette.fill,
+      borderColor: palette.border,
       nodeType: node.label as NodeLabel,
       filePath: node.filePath,
       startLine: node.startLine,
@@ -69,7 +76,7 @@ export function buildGraphology(nodes: GraphNode[], edges: GraphEdge[]): MultiDi
       graph.addEdgeWithKey(edge.id, edge.source, edge.target, {
         edgeType: edge.type,
         color: DEFAULT_EDGE_COLOR,
-        size: 1,
+        size: 0.5,
         confidence: edge.confidence,
         strength: edge.strength,
         stepNumber: edge.stepNumber,
@@ -79,10 +86,14 @@ export function buildGraphology(nodes: GraphNode[], edges: GraphEdge[]): MultiDi
     }
   }
 
-  // Assign node sizes proportional to degree after all edges are added.
-  graph.forEachNode((id) => {
+  // Assign node sizes: base 3, scaled by degree with gentle curve.
+  // Classes/interfaces get a slight boost for visual hierarchy.
+  graph.forEachNode((id, attrs) => {
     const degree = graph.degree(id);
-    graph.setNodeAttribute(id, 'size', 4 + Math.min(16, Math.sqrt(degree) * 2));
+    const nodeType = attrs.nodeType as string;
+    const isClass = nodeType === 'class' || nodeType === 'interface';
+    const base = isClass ? 5 : 3;
+    graph.setNodeAttribute(id, 'size', base + Math.min(12, Math.sqrt(degree) * 1.5));
   });
 
   return graph;

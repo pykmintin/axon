@@ -2,50 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { DeadCodeReport as DeadCodeReportType, DeadCodeEntry } from '@/types';
 import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore } from '@/stores/viewStore';
+import { TypeBadge } from '@/components/shared/TypeBadge';
 
 interface DeadCodeReportProps {
   data: DeadCodeReportType | null;
-}
-
-function TypeBadge({ type }: { type: string }) {
-  const key = type.toLowerCase();
-  const abbrevMap: Record<string, string> = {
-    function: '\u0192',
-    class: 'C',
-    method: 'M',
-    interface: 'I',
-    type_alias: 'T',
-    enum: 'E',
-  };
-  const colorMap: Record<string, string> = {
-    function: 'var(--node-function)',
-    class: 'var(--node-class)',
-    method: 'var(--node-method)',
-    interface: 'var(--node-interface)',
-    type_alias: 'var(--node-typealias)',
-    enum: 'var(--node-enum)',
-  };
-
-  return (
-    <span
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        width: 16,
-        height: 16,
-        fontSize: 10,
-        fontWeight: 700,
-        fontFamily: "'JetBrains Mono', monospace",
-        color: colorMap[key] ?? 'var(--text-secondary)',
-        background: 'var(--bg-primary)',
-        borderRadius: 'var(--radius)',
-        flexShrink: 0,
-      }}
-    >
-      {abbrevMap[key] ?? type.charAt(0).toUpperCase()}
-    </span>
-  );
 }
 
 function FileGroup({
@@ -128,7 +88,7 @@ function FileGroup({
               e.currentTarget.style.borderLeftColor = 'transparent';
             }}
           >
-            <TypeBadge type={entry.type} />
+            <TypeBadge label={entry.type} />
             <span
               style={{
                 flex: 1,

@@ -1,41 +1,13 @@
 import { useEffect, useState, useCallback } from 'react';
 import { graphApi } from '@/api/client';
-import { useDataStore, type NodeContext as StoreNodeContext } from '@/stores/dataStore';
+import { useDataStore } from '@/stores/dataStore';
 import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore } from '@/stores/viewStore';
 import type { GraphNode, CallerCalleeEntry } from '@/types';
 import { Zap, Eye } from 'lucide-react';
 import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
-
-// ---------------------------------------------------------------------------
-// Type badge helper
-// ---------------------------------------------------------------------------
-
-const TYPE_BADGE: Record<string, { symbol: string; color: string }> = {
-  function: { symbol: '\u0192', color: 'var(--node-function)' },
-  class: { symbol: 'C', color: 'var(--node-class)' },
-  method: { symbol: 'M', color: 'var(--node-method)' },
-  interface: { symbol: 'I', color: 'var(--node-interface)' },
-  type_alias: { symbol: 'T', color: 'var(--node-typealias)' },
-  enum: { symbol: 'E', color: 'var(--node-enum)' },
-};
-
-function TypeBadge({ label }: { label: string }) {
-  const badge = TYPE_BADGE[label] ?? { symbol: '?', color: 'var(--text-secondary)' };
-  return (
-    <span
-      style={{
-        color: badge.color,
-        fontFamily: "'JetBrains Mono', monospace",
-        fontWeight: 700,
-        fontSize: 13,
-        marginRight: 6,
-      }}
-    >
-      {badge.symbol}
-    </span>
-  );
-}
+import { TypeBadge } from '@/components/shared/TypeBadge';
+import { shortPath } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
 // Confidence tag
@@ -230,15 +202,6 @@ function TypeRefsList({
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function shortPath(filePath: string): string {
-  const parts = filePath.split('/');
-  return parts[parts.length - 1] ?? filePath;
-}
-
-// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -262,15 +225,7 @@ export function ContextTab({ nodeId }: ContextTabProps) {
       setError(null);
       try {
         const ctx = await graphApi.getNode(id);
-        // Map API NodeContext (processMemberships) to store NodeContext (processes)
-        const storeCtx: StoreNodeContext = {
-          node: ctx.node,
-          callers: ctx.callers,
-          callees: ctx.callees,
-          typeRefs: ctx.typeRefs,
-          processes: ctx.processMemberships ?? [],
-        };
-        setNodeContext(storeCtx);
+        setNodeContext(ctx);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load node context');
         setNodeContext(null);
@@ -310,8 +265,7 @@ export function ContextTab({ nodeId }: ContextTabProps) {
 
   if (!nodeContext) return null;
 
-  const { node, callers, callees, typeRefs } = nodeContext;
-  const processMemberships = nodeContext.processes ?? [];
+  const { node, callers, callees, typeRefs, processMemberships } = nodeContext;
 
   return (
     <div style={{ fontFamily: "'JetBrains Mono', monospace" }}>

@@ -102,51 +102,27 @@ def get_communities(request: Request) -> dict:
     storage = request.app.state.storage
 
     try:
-        community_rows = storage.execute_raw(
+        rows = storage.execute_raw(
             "MATCH (c) WHERE labels(c) = 'Community' "
-            "RETURN c.id, c.name"
+            "OPTIONAL MATCH (n)-[r]->(c) WHERE r.rel_type = 'member_of' "
+            "RETURN c.id, c.name, c.cohesion, collect(n.id)"
         )
     except Exception as exc:
         logger.error("Communities query failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Communities query failed") from exc
 
-    if not community_rows:
+    if not rows:
         return {"communities": []}
 
     communities = []
-    for row in community_rows:
-        cid = row[0] if row else ""
-        cname = row[1] if len(row) > 1 else ""
-
-        try:
-            member_rows = storage.execute_raw(
-                f"MATCH (n)-[r]->(c) WHERE c.id = '{cid}' "
-                f"AND r.rel_type = 'member_of' "
-                f"RETURN n.id"
-            )
-        except Exception:
-            member_rows = []
-
-        member_ids = [r[0] for r in (member_rows or []) if r]
-
-        try:
-            cohesion_rows = storage.execute_raw(
-                f"MATCH (c) WHERE c.id = '{cid}' RETURN c.cohesion"
-            )
-            cohesion = (
-                cohesion_rows[0][0]
-                if cohesion_rows and cohesion_rows[0] and cohesion_rows[0][0] is not None
-                else None
-            )
-        except Exception:
-            cohesion = None
-
+    for row in rows:
+        cid, cname, cohesion, member_ids = row
         communities.append({
             "id": cid,
             "name": cname,
-            "memberCount": len(member_ids),
+            "memberCount": len(member_ids) if member_ids else 0,
             "cohesion": cohesion,
-            "members": member_ids,
+            "members": member_ids or [],
         })
 
     return {"communities": communities}

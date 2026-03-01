@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { analysisApi } from '@/api/client';
 import { useGraphStore } from '@/stores/graphStore';
 import type { DeadCodeReport, DeadCodeEntry } from '@/types';
+import { TypeBadge } from '@/components/shared/TypeBadge';
 
 export function DeadCode() {
   const [report, setReport] = useState<DeadCodeReport | null>(null);
@@ -228,7 +229,7 @@ function FileGroup({
             e.currentTarget.style.background = 'transparent';
           }}
         >
-          <DeadTypeBadge type={entry.type} />
+          <TypeBadge label={entry.type} />
 
           <span className="truncate" style={{ flex: 1, minWidth: 0 }}>
             {entry.name}
@@ -243,37 +244,3 @@ function FileGroup({
   );
 }
 
-function DeadTypeBadge({ type }: { type: string }) {
-  const key = type.toLowerCase();
-  const abbrevMap: Record<string, string> = {
-    function: '\u0192',
-    class: 'C',
-    method: 'M',
-    interface: 'I',
-    type_alias: 'T',
-    enum: 'E',
-  };
-  const colorMap: Record<string, string> = {
-    function: 'var(--node-function)',
-    class: 'var(--node-class)',
-    method: 'var(--node-method)',
-    interface: 'var(--node-interface)',
-    type_alias: 'var(--node-typealias)',
-    enum: 'var(--node-enum)',
-  };
-
-  return (
-    <span
-      style={{
-        color: colorMap[key] ?? 'var(--text-secondary)',
-        fontWeight: 600,
-        fontSize: 9,
-        width: 12,
-        textAlign: 'center',
-        flexShrink: 0,
-      }}
-    >
-      {abbrevMap[key] ?? type.charAt(0).toUpperCase()}
-    </span>
-  );
-}

@@ -10,6 +10,7 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import Sigma from 'sigma';
 import type { MultiDirectedGraph } from 'graphology';
+import { createNodeBorderProgram } from '@sigma/node-border';
 import FA2LayoutSupervisor from 'graphology-layout-forceatlas2/worker';
 import { useGraphStore } from '@/stores/graphStore';
 import { useGraph } from '@/hooks/useGraph';
@@ -332,23 +333,41 @@ export function GraphCanvas({ className }: GraphCanvasProps) {
     // Snapshot the current store values for the reducers. The refresh effect
     // below triggers sigma.refresh() whenever these change, which causes
     // Sigma to re-invoke the reducers with fresh closure values.
+    // Create a bordered node program: inner fill + thin outer border ring.
+    const BorderedNodeProgram = createNodeBorderProgram({
+      borders: [
+        { size: { value: 0.15, mode: 'relative' }, color: { attribute: 'borderColor', defaultValue: '#5a6a7a' } },
+        { size: { fill: true }, color: { attribute: 'color' } },
+      ],
+    });
+
     const sigma = new Sigma(graph, container, {
       renderLabels: true,
       labelFont: 'JetBrains Mono, monospace',
       labelSize: 11,
-      labelColor: { color: '#c5ced6' },
-      defaultEdgeColor: '#3d4f5f',
-      defaultNodeColor: '#6b7d8e',
-      labelRenderedSizeThreshold: 6,
+      labelWeight: '500',
+      labelColor: { color: '#8899aa' },
+      defaultEdgeColor: '#1e2a36',
+      defaultNodeColor: '#4a5a6a',
+      // Only show labels for nodes that are large enough (high degree).
+      labelRenderedSizeThreshold: 12,
+      // Reduce label density to prevent overlap.
+      labelDensity: 0.5,
+      labelGridCellSize: 120,
+      // Hide edges while panning/zooming to reduce clutter.
+      hideEdgesOnMove: true,
+      // Use bordered node program instead of plain circle.
+      defaultNodeType: 'bordered',
+      nodeProgramClasses: {
+        bordered: BorderedNodeProgram,
+      },
 
       nodeReducer: (node, data) => {
         const res = { ...data };
         const nodeType = (data.nodeType ?? '') as string;
 
-        // Retrieve current store state directly for the reducer.
         const state = useGraphStore.getState();
 
-        // Hide node types that are filtered out.
         if (!state.visibleNodeTypes.has(nodeType)) {
           res.hidden = true;
           return res;
@@ -360,14 +379,27 @@ export function GraphCanvas({ className }: GraphCanvasProps) {
             graph.hasEdge(state.selectedNodeId, node) ||
             graph.hasEdge(node, state.selectedNodeId);
           if (!isNeighbor) {
-            res.color = '#1a2030';
+            res.color = '#141a22';
             res.label = '';
+            res.zIndex = 0;
+          } else {
+            // Connected neighbors stay visible and get a label.
+            res.forceLabel = true;
+            res.zIndex = 2;
           }
+        }
+
+        // Selected node itself: brighten and force label.
+        if (state.selectedNodeId && node === state.selectedNodeId) {
+          res.highlighted = true;
+          res.forceLabel = true;
+          res.zIndex = 3;
         }
 
         // Highlight on hover.
         if (state.hoveredNodeId && node === state.hoveredNodeId) {
           res.highlighted = true;
+          res.forceLabel = true;
         }
 
         return res;
@@ -379,20 +411,21 @@ export function GraphCanvas({ className }: GraphCanvasProps) {
 
         const state = useGraphStore.getState();
 
-        // Hide edge types that are filtered out.
         if (!state.visibleEdgeTypes.has(edgeType)) {
           res.hidden = true;
           return res;
         }
 
-        // When a node is selected, brighten connected edges, dim the rest.
         if (state.selectedNodeId) {
           const source = graph.source(edge);
           const target = graph.target(edge);
           if (source !== state.selectedNodeId && target !== state.selectedNodeId) {
-            res.color = '#0a0e14';
+            // Dim unconnected edges almost invisible.
+            res.hidden = true;
           } else {
-            res.size = 2;
+            // Brighten connected edges.
+            res.color = '#4488cc';
+            res.size = 1.5;
           }
         }
 
@@ -421,12 +454,19 @@ export function GraphCanvas({ className }: GraphCanvasProps) {
     });
 
     // Start ForceAtlas2 layout in a web worker.
+    // Tuned for ~2k–5k node graphs on a dark canvas:
+    //   - Higher scalingRatio (8) pushes nodes further apart
+    //   - Lower gravity (0.3) prevents tight clustering
+    //   - strongGravityMode keeps outliers from drifting to infinity
+    //   - barnesHutOptimize for O(n log n) performance
     const layout = new FA2LayoutSupervisor(graph, {
       settings: {
-        gravity: 1,
-        scalingRatio: 2,
+        gravity: 0.3,
+        scalingRatio: 8,
+        strongGravityMode: true,
         barnesHutOptimize: true,
-        slowDown: 5,
+        barnesHutTheta: 0.5,
+        slowDown: 3,
       },
     });
     layout.start();

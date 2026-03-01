@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useGraphStore } from '@/stores/graphStore';
+import { shortPath } from '@/lib/utils';
 
 interface TreeNode {
   id: string;
@@ -163,12 +164,6 @@ function TreeNodeRow({ node, depth }: { node: TreeNode; depth: number }) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function shortPath(filePath: string): string {
-  const parts = filePath.split('/');
-  if (parts.length <= 2) return filePath;
-  return parts.slice(-2).join('/');
-}
 
 function buildForest(
   nodes: { id: string; name: string; filePath: string; startLine: number; label: string }[],

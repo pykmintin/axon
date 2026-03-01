@@ -1,49 +1,5 @@
 import { create } from 'zustand';
-
-export interface GraphNode {
-  id: string;
-  label: string;
-  name: string;
-  filePath: string;
-  startLine: number;
-  endLine: number;
-  signature: string;
-  language: string;
-  className: string;
-  isDead: boolean;
-  isEntryPoint: boolean;
-  isExported: boolean;
-}
-
-export interface GraphEdge {
-  id: string;
-  type: string;
-  source: string;
-  target: string;
-  confidence: number;
-  strength?: number;
-  stepNumber?: number;
-}
-
-export interface Community {
-  id: string;
-  name: string;
-  memberCount: number;
-  cohesion: number;
-  members: string[];
-}
-
-export interface OverviewStats {
-  nodesByLabel: Record<string, number>;
-  edgesByType: Record<string, number>;
-  totals: { nodes: number; edges: number };
-}
-
-export interface DiffOverlay {
-  added: Set<string>;
-  removed: Set<string>;
-  modified: Set<string>;
-}
+import type { GraphNode, GraphEdge, Community, OverviewStats, DiffOverlay } from '@/types';
 
 interface GraphStore {
   // Data

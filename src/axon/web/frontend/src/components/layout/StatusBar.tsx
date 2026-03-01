@@ -7,7 +7,7 @@ export function StatusBar() {
   const deadCode = useDataStore((s) => s.deadCode);
   const healthScore = useDataStore((s) => s.healthScore);
 
-  const nodeCount = overview?.totals.nodes ?? 0;
+  const nodeCount = overview?.totalNodes ?? 0;
   const communityCount = communities.length;
   const deadCount = deadCode?.total ?? 0;
   const health = healthScore?.score ?? null;
