@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { analysisApi, graphApi } from '@/api/client';
+import { errorMessage } from '@/lib/utils';
 import { useGraphStore } from '@/stores/graphStore';
 import { useDataStore } from '@/stores/dataStore';
 
@@ -35,7 +36,7 @@ export function useSSE(): void {
             if (healthResp) setHealthScore(healthResp);
           })
           .catch((err: unknown) => {
-            console.error('[SSE] Failed to fetch updated data:', err);
+            console.error(errorMessage(err, 'Failed to fetch updated data'));
           });
       });
 

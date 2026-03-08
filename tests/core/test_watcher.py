@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from axon.core.graph.graph import KnowledgeGraph
+from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType
 from axon.core.ingestion.pipeline import reindex_files, run_pipeline
+from axon.core.ingestion.walker import FileEntry, read_file
 from axon.core.ingestion.watcher import (
-    _reindex_files,
-    _get_head_sha,
     _compute_dirty_node_ids,
+    _get_head_sha,
+    _reindex_files,
     _run_incremental_global_phases,
 )
-from axon.core.graph.model import NodeLabel
-from axon.core.ingestion.walker import FileEntry, read_file
 from axon.core.storage.kuzu_backend import KuzuBackend
 
 
@@ -161,6 +163,75 @@ class TestReindexFiles:
         # Old symbol should be gone.
         assert storage.get_node("function:src/app.py:hello") is None
 
+    def test_reindex_rebuilds_same_file_call_edges_for_new_symbols(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        run_pipeline(tmp_repo, storage, embeddings=False)
+
+        (tmp_repo / "src" / "app.py").write_text(
+            "def hello():\n"
+            "    return world()\n"
+            "\n"
+            "def world():\n"
+            "    return 'world'\n",
+            encoding="utf-8",
+        )
+
+        entry = FileEntry(
+            path="src/app.py",
+            content=(tmp_repo / "src" / "app.py").read_text(),
+            language="python",
+        )
+        reindex_files([entry], tmp_repo, storage)
+
+        graph = storage.load_graph()
+        calls = graph.get_relationships_by_type(RelType.CALLS)
+        assert any(
+            rel.source == "function:src/app.py:hello"
+            and rel.target == "function:src/app.py:world"
+            for rel in calls
+        )
+
+    def test_reindex_rebuilds_import_edges_for_new_files(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        run_pipeline(tmp_repo, storage, embeddings=False)
+
+        (tmp_repo / "src" / "app.py").write_text(
+            "from .helper_new import helper_new\n"
+            "\n"
+            "def hello():\n"
+            "    return helper_new()\n",
+            encoding="utf-8",
+        )
+        (tmp_repo / "src" / "helper_new.py").write_text(
+            "def helper_new():\n"
+            "    return 42\n",
+            encoding="utf-8",
+        )
+
+        entries = [
+            FileEntry(
+                path="src/app.py",
+                content=(tmp_repo / "src" / "app.py").read_text(),
+                language="python",
+            ),
+            FileEntry(
+                path="src/helper_new.py",
+                content=(tmp_repo / "src" / "helper_new.py").read_text(),
+                language="python",
+            ),
+        ]
+        reindex_files(entries, tmp_repo, storage)
+
+        graph = storage.load_graph()
+        imports = graph.get_relationships_by_type(RelType.IMPORTS)
+        assert any(
+            rel.source == "file:src/app.py:"
+            and rel.target == "file:src/helper_new.py:"
+            for rel in imports
+        )
+
 
 class TestWatcherReindexFiles:
     def test_reindexes_changed_files(
@@ -251,8 +322,6 @@ class TestWatcherReindexFiles:
 
 class TestGetHeadSha:
     def test_returns_sha_in_git_repo(self, tmp_repo: Path) -> None:
-        import os
-
         subprocess.run(["git", "init"], cwd=tmp_repo, capture_output=True)
         subprocess.run(["git", "add", "."], cwd=tmp_repo, capture_output=True)
         env = {
@@ -281,7 +350,7 @@ class TestReindexFilesReturnType:
     def test_returns_count_and_paths(
         self, tmp_repo: Path, storage: KuzuBackend
     ) -> None:
-        run_pipeline(tmp_repo, storage, full=True, embeddings=False)
+        run_pipeline(tmp_repo, storage, embeddings=False)
 
         changed = [tmp_repo / "src" / "app.py"]
         count, paths = _reindex_files(changed, tmp_repo, storage)
@@ -293,35 +362,73 @@ class TestComputeDirtyNodeIds:
     def test_includes_dirty_file_nodes(
         self, tmp_repo: Path, storage: KuzuBackend
     ) -> None:
-        run_pipeline(tmp_repo, storage, full=True, embeddings=False)
+        run_pipeline(tmp_repo, storage, embeddings=False)
 
         graph = storage.load_graph()
         dirty_ids = _compute_dirty_node_ids(graph, {"src/app.py"})
         assert any("app.py" in nid for nid in dirty_ids)
 
     def test_returns_empty_for_empty_input(self, storage: KuzuBackend) -> None:
-        from axon.core.graph.graph import KnowledgeGraph
         graph = KnowledgeGraph()
         result = _compute_dirty_node_ids(graph, set())
         assert result == set()
 
 
 class TestRunIncrementalGlobalPhases:
+    def test_small_changes_preserve_existing_synthetic_nodes(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        run_pipeline(tmp_repo, storage, embeddings=False)
+
+        storage.add_nodes([
+            GraphNode(
+                id="community:synthetic:test",
+                label=NodeLabel.COMMUNITY,
+                name="Synthetic Community",
+            ),
+        ])
+        storage.add_relationships([
+            GraphRelationship(
+                id="member_of:function:src/app.py:hello->community:synthetic:test",
+                type=RelType.MEMBER_OF,
+                source="function:src/app.py:hello",
+                target="community:synthetic:test",
+            ),
+        ])
+
+        _run_incremental_global_phases(
+            storage, tmp_repo, dirty_files={"src/app.py"}, run_coupling=False,
+        )
+
+        graph = storage.load_graph()
+        assert graph.get_node("community:synthetic:test") is not None
+        assert any(
+            rel.type == RelType.MEMBER_OF
+            and rel.target == "community:synthetic:test"
+            for rel in graph.iter_relationships()
+        )
+
     def test_no_stale_synthetic_nodes_after_rerun(
         self, tmp_repo: Path, storage: KuzuBackend
     ) -> None:
-        run_pipeline(tmp_repo, storage, full=True, embeddings=False)
+        run_pipeline(tmp_repo, storage, embeddings=False)
 
         # First incremental run — should create communities.
         _run_incremental_global_phases(
-            storage, tmp_repo, dirty_files={"src/app.py"}, run_coupling=False,
+            storage,
+            tmp_repo,
+            dirty_files={"src/app.py", "src/utils.py", "src/third.py"},
+            run_coupling=False,
         )
         graph1 = storage.load_graph()
         comm_count_1 = len(list(graph1.get_nodes_by_label(NodeLabel.COMMUNITY)))
 
         # Second incremental run — old communities should be deleted before new ones.
         _run_incremental_global_phases(
-            storage, tmp_repo, dirty_files={"src/app.py"}, run_coupling=False,
+            storage,
+            tmp_repo,
+            dirty_files={"src/app.py", "src/utils.py", "src/third.py"},
+            run_coupling=False,
         )
         graph2 = storage.load_graph()
         comm_count_2 = len(list(graph2.get_nodes_by_label(NodeLabel.COMMUNITY)))

@@ -7,6 +7,7 @@ from axon.core.graph.model import NodeLabel, RelType, generate_id
 from axon.core.ingestion.structure import process_structure
 from axon.core.ingestion.walker import FileEntry
 
+
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
     """Return a fresh, empty KnowledgeGraph."""

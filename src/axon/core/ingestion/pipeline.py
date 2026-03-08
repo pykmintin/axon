@@ -20,27 +20,32 @@ Phases executed:
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from axon.config.ignore import load_gitignore
+from axon.core.embeddings.embedder import embed_graph
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphRelationship, NodeLabel
-from axon.core.embeddings.embedder import embed_graph
 from axon.core.ingestion.calls import process_calls
 from axon.core.ingestion.community import process_communities
-from axon.core.ingestion.coupling import process_coupling
+from axon.core.ingestion.coupling import resolve_coupling
 from axon.core.ingestion.dead_code import process_dead_code
 from axon.core.ingestion.heritage import process_heritage
-from axon.core.ingestion.imports import process_imports
+from axon.core.ingestion.imports import build_file_index, process_imports
 from axon.core.ingestion.parser_phase import process_parsing
 from axon.core.ingestion.processes import process_processes
+from axon.core.ingestion.resolved import ResolvedEdge
 from axon.core.ingestion.structure import process_structure
+from axon.core.ingestion.symbol_lookup import build_name_index
 from axon.core.ingestion.types import process_types
 from axon.core.ingestion.walker import FileEntry, walk_repo
 from axon.core.storage.base import StorageBackend
+
 
 @dataclass
 class PipelineResult:
@@ -65,10 +70,26 @@ _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.PROCESS,
 }
 
+def _write_collected_edges(
+    edges: list[ResolvedEdge],
+    graph: KnowledgeGraph,
+) -> None:
+    """Write a batch of resolved edges to the graph (sequential, deduped)."""
+    for edge in edges:
+        graph.add_relationship(
+            GraphRelationship(
+                id=edge.rel_id,
+                type=edge.rel_type,
+                source=edge.source,
+                target=edge.target,
+                properties=edge.properties,
+            )
+        )
+
+
 def run_pipeline(
     repo_path: Path,
     storage: StorageBackend | None = None,
-    full: bool = False,
     progress_callback: Callable[[str, float], None] | None = None,
     embeddings: bool = True,
 ) -> tuple[KnowledgeGraph, PipelineResult]:
@@ -85,9 +106,6 @@ def run_pipeline(
     storage:
         An already-initialised :class:`StorageBackend` to persist the graph.
         Pass ``None`` to skip storage loading.
-    full:
-        When ``True``, skip incremental-diff logic (Phase 0) and force a full
-        re-index.  Currently Phase 0 is a no-op regardless of this flag.
     progress_callback:
         Optional ``(phase_name, progress)`` callback where *progress* is a
         float in ``[0.0, 1.0]``.
@@ -124,39 +142,76 @@ def run_pipeline(
     report("Parsing code", 1.0)
 
     report("Resolving imports", 0.0)
-    process_imports(parse_data, graph)
+    process_imports(parse_data, graph, parallel=True)
     report("Resolving imports", 1.0)
 
-    report("Tracing calls", 0.0)
-    process_calls(parse_data, graph)
-    report("Tracing calls", 1.0)
+    shared_labels = (
+        NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS,
+        NodeLabel.INTERFACE, NodeLabel.TYPE_ALIAS,
+    )
+    shared_name_index = build_name_index(graph, shared_labels)
+    heritage_labels = {NodeLabel.CLASS, NodeLabel.INTERFACE}
+    heritage_name_index: dict[str, list[str]] = {}
+    for name, ids in shared_name_index.items():
+        filtered = [
+            nid for nid in ids
+            if (n := graph.get_node(nid)) is not None and n.label in heritage_labels
+        ]
+        if filtered:
+            heritage_name_index[name] = filtered
 
-    report("Extracting heritage", 0.0)
-    process_heritage(parse_data, graph)
-    report("Extracting heritage", 1.0)
+    report("Resolving relationships", 0.0)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        calls_f = pool.submit(
+            process_calls, parse_data, graph,
+            name_index=shared_name_index, parallel=False, collect=True,
+        )
+        heritage_f = pool.submit(
+            process_heritage, parse_data, graph,
+            name_index=heritage_name_index, parallel=False, collect=True,
+        )
+        types_f = pool.submit(
+            process_types, parse_data, graph,
+            name_index=shared_name_index, parallel=False, collect=True,
+        )
 
-    report("Analyzing types", 0.0)
-    process_types(parse_data, graph)
-    report("Analyzing types", 1.0)
+    _write_collected_edges(calls_f.result() or [], graph)
 
-    report("Detecting communities", 0.0)
-    result.clusters = process_communities(graph)
-    report("Detecting communities", 1.0)
+    heritage_edges, heritage_patches = heritage_f.result()
+    _write_collected_edges(heritage_edges, graph)
+    for patch in heritage_patches:
+        node = graph.get_node(patch.node_id)
+        if node is not None:
+            node.properties[patch.key] = patch.value
 
-    report("Detecting execution flows", 0.0)
-    result.processes = process_processes(graph)
-    report("Detecting execution flows", 1.0)
+    _write_collected_edges(types_f.result() or [], graph)
+    report("Resolving relationships", 1.0)
 
-    report("Finding dead code", 0.0)
-    result.dead_code = process_dead_code(graph)
-    report("Finding dead code", 1.0)
+    coupling_file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
 
-    report("Analyzing git history", 0.0)
-    result.coupled_pairs = process_coupling(graph, repo_path)
-    report("Analyzing git history", 1.0)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        coupling_future = pool.submit(
+            resolve_coupling, graph, repo_path, file_nodes=coupling_file_nodes,
+        )
 
-    # Compute result counts before the optional embedding step so a
-    # fastembed failure never leaves symbols/relationships at zero.
+        report("Detecting communities", 0.0)
+        result.clusters = process_communities(graph)
+        report("Detecting communities", 1.0)
+
+        report("Detecting execution flows", 0.0)
+        result.processes = process_processes(graph)
+        report("Detecting execution flows", 1.0)
+
+        report("Finding dead code", 0.0)
+        result.dead_code = process_dead_code(graph)
+        report("Finding dead code", 1.0)
+
+        report("Analyzing git history", 0.0)
+        coupling_edges = coupling_future.result()
+        _write_collected_edges(coupling_edges, graph)
+        result.coupled_pairs = len(coupling_edges)
+        report("Analyzing git history", 1.0)
+
     result.symbols = sum(1 for n in graph.iter_nodes() if n.label in _SYMBOL_LABELS)
     result.relationships = graph.relationship_count
 
@@ -173,8 +228,7 @@ def run_pipeline(
                 result.embeddings = len(node_embeddings)
                 report("Generating embeddings", 1.0)
             except Exception:
-                import logging as _logging
-                _logging.getLogger(__name__).warning(
+                logging.getLogger(__name__).warning(
                     "Embedding phase failed — search will use FTS only",
                     exc_info=True,
                 )
@@ -188,6 +242,7 @@ def reindex_files(
     file_entries: list[FileEntry],
     repo_path: Path,
     storage: StorageBackend,
+    rebuild_fts: bool = True,
 ) -> KnowledgeGraph:
     """Re-index specific files through phases 2-7 (file-local phases).
 
@@ -212,10 +267,8 @@ def reindex_files(
     Returns
     -------
     KnowledgeGraph
-        The partial in-memory graph containing only the reindexed files.
+        The hydrated in-memory graph used for incremental resolution.
     """
-    # DETACH DELETE drops inbound edges from unchanged files — save them
-    # before deletion and re-insert after rebuild.
     changed_files = {entry.path for entry in file_entries}
     saved_edges: list[GraphRelationship] = []
     for fp in changed_files:
@@ -226,30 +279,67 @@ def reindex_files(
     for entry in file_entries:
         storage.remove_nodes_by_file(entry.path)
 
-    graph = KnowledgeGraph()
+    graph = storage.load_graph()
 
     process_structure(file_entries, graph)
     parse_data = process_parsing(file_entries, graph)
-    process_imports(parse_data, graph)
-    process_calls(parse_data, graph)
-    process_heritage(parse_data, graph)
-    process_types(parse_data, graph)
 
-    storage.add_nodes(list(graph.iter_nodes()))
-    storage.add_relationships(list(graph.iter_relationships()))
+    file_index = build_file_index(graph)
+
+    shared_labels = (
+        NodeLabel.FUNCTION,
+        NodeLabel.METHOD,
+        NodeLabel.CLASS,
+        NodeLabel.INTERFACE,
+        NodeLabel.TYPE_ALIAS,
+    )
+    shared_name_index = build_name_index(graph, shared_labels)
+    heritage_labels = {NodeLabel.CLASS, NodeLabel.INTERFACE}
+    heritage_name_index: dict[str, list[str]] = {}
+    for name, ids in shared_name_index.items():
+        filtered = [
+            nid for nid in ids
+            if (n := graph.get_node(nid)) is not None and n.label in heritage_labels
+        ]
+        if filtered:
+            heritage_name_index[name] = filtered
+
+    process_imports(parse_data, graph, file_index=file_index)
+    process_calls(parse_data, graph, name_index=shared_name_index)
+    process_heritage(parse_data, graph, name_index=heritage_name_index)
+    process_types(parse_data, graph, name_index=shared_name_index)
+
+    incremental_nodes = [
+        node for node in graph.iter_nodes()
+        if (
+            node.file_path in changed_files
+            or (
+                node.label == NodeLabel.FOLDER
+                and any(
+                    file_path == node.file_path or file_path.startswith(f"{node.file_path}/")
+                    for file_path in changed_files
+                )
+            )
+        )
+    ]
+    incremental_node_ids = {node.id for node in incremental_nodes}
+    incremental_relationships = [
+        rel for rel in graph.iter_relationships()
+        if rel.source in incremental_node_ids or rel.target in incremental_node_ids
+    ]
+
+    storage.add_nodes(incremental_nodes)
+    storage.add_relationships(incremental_relationships)
 
     if saved_edges:
         storage.add_relationships(saved_edges)
 
-    storage.rebuild_fts_indexes()
+    if rebuild_fts:
+        storage.rebuild_fts_indexes()
 
     return graph
 
 def build_graph(repo_path: Path) -> KnowledgeGraph:
-    """Run phases 1-11 and return the in-memory graph (no storage load).
-
-    This is used by branch comparison to build a graph snapshot without
-    needing a storage backend.
-    """
-    graph, _ = run_pipeline(repo_path)
+    """Run phases 1-11 and return the in-memory graph without persisting to storage."""
+    graph, _ = run_pipeline(repo_path, embeddings=False)
     return graph

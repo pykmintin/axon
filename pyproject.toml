@@ -88,3 +88,6 @@ select = ["E", "F", "I", "N", "W"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "allow_update_notice: run CLI tests with the real update notifier enabled",
+]

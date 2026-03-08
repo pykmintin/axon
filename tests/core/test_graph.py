@@ -10,6 +10,8 @@ from axon.core.graph.model import (
     RelType,
     generate_id,
 )
+
+
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
     """Return a fresh, empty KnowledgeGraph."""

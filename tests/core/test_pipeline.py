@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
 from axon.core.storage.kuzu_backend import KuzuBackend
+
 
 @pytest.fixture()
 def tmp_repo(tmp_path: Path) -> Path:
@@ -113,8 +115,7 @@ class TestRunPipelineProgressCallback:
         assert "Processing structure" in phase_names
         assert "Parsing code" in phase_names
         assert "Resolving imports" in phase_names
-        assert "Tracing calls" in phase_names
-        assert "Extracting heritage" in phase_names
+        assert "Resolving relationships" in phase_names
         assert "Loading to storage" in phase_names
 
 
@@ -242,16 +243,16 @@ class TestRunPipelineProgressIncludesNewPhases:
 
         phase_names = {name for name, _ in calls}
 
-        # Phases 1-6 (existing).
+        # Phases 1-4 (sequential).
         assert "Walking files" in phase_names
         assert "Processing structure" in phase_names
         assert "Parsing code" in phase_names
         assert "Resolving imports" in phase_names
-        assert "Tracing calls" in phase_names
-        assert "Extracting heritage" in phase_names
 
-        # Phases 7-11 (new).
-        assert "Analyzing types" in phase_names
+        # Phases 5-7 (concurrent calls/heritage/types).
+        assert "Resolving relationships" in phase_names
+
+        # Phases 8-11 (global).
         assert "Detecting communities" in phase_names
         assert "Detecting execution flows" in phase_names
         assert "Finding dead code" in phase_names
@@ -284,8 +285,6 @@ class TestRunPipelineEmbeddings:
     def test_result_symbols_set_even_if_embed_fails(
         self, rich_repo: Path, rich_storage: KuzuBackend
     ) -> None:
-        from unittest.mock import patch
-
         with patch(
             "axon.core.ingestion.pipeline.embed_graph",
             side_effect=RuntimeError("model not found"),

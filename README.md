@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./axon-logo.png" alt="Axon logo" width="420" />
+</p>
+
 # Axon
 
 **Building the knowledge graph for AI code agents.**
@@ -74,13 +78,14 @@ Then add to `.mcp.json` in your project root:
 }
 ```
 
-Your AI agent now has full structural understanding of your codebase. The knowledge graph updates live as you edit.
+Your AI agent now has full structural understanding of your codebase. If you want an explicit shared host for multiple Claude sessions plus the UI, use `axon host --watch`.
 
 Or launch the web UI to explore the graph yourself:
 
 ```bash
-axon ui                      # Opens browser at localhost:8420
+axon ui                      # Opens the running host UI if present, otherwise starts standalone UI
 axon ui --watch              # Live reload on file changes
+axon host --watch            # Optional explicit shared host: UI + multi-session MCP
 ```
 
 ---
@@ -267,7 +272,13 @@ Axon exposes its full intelligence as an MCP server. Set it up once, and your AI
 }
 ```
 
-Or run `axon setup --claude` / `axon setup --cursor` to generate the config.
+Optional new feature:
+
+```bash
+axon host --watch
+```
+
+This starts a shared host for the UI and multiple MCP clients. `axon setup --claude` / `axon setup --cursor` still prints the standard config.
 
 The `--watch` flag enables live re-indexing — the graph updates as you edit code.
 
@@ -307,7 +318,8 @@ Axon ships with a built-in web dashboard for visual exploration — no extension
 
 ```bash
 cd your-project
-axon ui              # Launches at http://localhost:8420
+axon ui              # Launches standalone UI, or attaches to an existing host
+axon host            # Optional shared host for UI + multiple MCP clients
 ```
 
 ### Views
@@ -431,11 +443,18 @@ axon cypher QUERY            Execute a raw Cypher query (read-only)
 axon watch                   Watch mode — live re-indexing on file changes
 axon diff BASE..HEAD         Structural branch comparison
 
+axon host                    Shared host for UI + HTTP MCP (default: localhost:8420)
+    --port / -p PORT         Port to serve on (default: 8420)
+    --watch / --no-watch     Enable live file watching
+    --dev                    Dev mode — proxy to Vite dev server for HMR
+    --no-open                Don't auto-open browser
+
 axon ui                      Launch the web UI (default: localhost:8420)
     --port / -p PORT         Port to serve on (default: 8420)
     --watch / -w             Enable live file watching with auto-reindex
     --dev                    Dev mode — proxy to Vite dev server for HMR
     --no-open                Don't auto-open browser
+    --direct                 Force standalone mode even if a shared host exists
 
 axon setup                   Print MCP configuration JSON
     --claude                 For Claude Code

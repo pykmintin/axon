@@ -1,24 +1,33 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from axon.core.graph.model import GraphNode, NodeLabel
+from axon.core.graph.graph import KnowledgeGraph
+from axon.core.graph.model import GraphNode, GraphRelationship, NodeLabel, RelType
 from axon.core.storage.base import SearchResult
+from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
     _confidence_tag,
     _format_query_results,
     _group_by_process,
+    handle_call_path,
+    handle_communities,
     handle_context,
+    handle_coupling,
+    handle_cycles,
     handle_cypher,
     handle_dead_code,
     handle_detect_changes,
+    handle_explain,
+    handle_file_context,
     handle_impact,
     handle_list_repos,
     handle_query,
+    handle_review_risk,
+    handle_test_impact,
 )
 
 
@@ -190,6 +199,38 @@ class TestHandleContext:
         result = handle_context(mock_storage, "deprecated")
         assert "DEAD CODE" in result
 
+    def test_heritage_shown(self, mock_storage):
+        mock_storage.get_node.return_value = GraphNode(
+            id="class:src/models.py:Admin",
+            label=NodeLabel.CLASS,
+            name="Admin",
+            file_path="src/models.py",
+            start_line=50,
+            end_line=80,
+        )
+        mock_storage.execute_raw.side_effect = [
+            # Heritage query
+            [["User", "src/models.py", "extends"]],
+            # Imported-by query
+            [],
+        ]
+        result = handle_context(mock_storage, "Admin")
+        assert "Heritage" in result
+        assert "extends" in result
+        assert "User" in result
+
+    def test_imported_by_shown(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            # Heritage query
+            [],
+            # Imported-by query
+            [["src/mcp/server.py"], ["tests/test_auth.py"]],
+        ]
+        result = handle_context(mock_storage, "validate")
+        assert "Imported by (2)" in result
+        assert "src/mcp/server.py" in result
+        assert "tests/test_auth.py" in result
+
 
 class TestHandleImpact:
     def test_no_downstream(self, mock_storage):
@@ -322,8 +363,6 @@ class TestHandleCypher:
 
 class TestResources:
     def test_get_schema(self):
-        from axon.mcp.resources import get_schema
-
         result = get_schema()
         assert "Node Labels:" in result
         assert "Relationship Types:" in result
@@ -331,15 +370,11 @@ class TestResources:
         assert "Function" in result
 
     def test_get_overview(self, mock_storage):
-        from axon.mcp.resources import get_overview
-
         mock_storage.execute_raw.return_value = [["Function", 42]]
         result = get_overview(mock_storage)
         assert "Axon Codebase Overview" in result
 
     def test_get_dead_code_list(self, mock_storage):
-        from axon.mcp.resources import get_dead_code_list
-
         mock_storage.execute_raw.return_value = [
             ["function:src/old.py:old_func", "old_func", "src/old.py", 10, "Function"],
         ]
@@ -348,8 +383,6 @@ class TestResources:
         assert "old_func" in result
 
     def test_get_dead_code_list_empty(self, mock_storage):
-        from axon.mcp.resources import get_dead_code_list
-
         result = get_dead_code_list(mock_storage)
         assert "No dead code detected" in result
 
@@ -522,3 +555,483 @@ class TestImpactDepthGrouping:
         mock_storage.traverse_with_depth.return_value = []
         result = handle_impact(mock_storage, "validate", depth=100)
         assert "No upstream callers found" in result
+
+
+class TestHandleCoupling:
+    def test_returns_coupled_files(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [["src/auth/session.py", 0.85, 12], ["src/tests/test_login.py", 0.72, 9]],
+            [["src/auth/session.py"]],
+        ]
+        result = handle_coupling(mock_storage, "src/auth/login.py")
+        assert "src/auth/session.py" in result
+        assert "0.85" in result
+        assert "src/tests/test_login.py" in result
+
+    def test_flags_hidden_dependencies(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [["src/tests/test_login.py", 0.72, 9]],
+            [],
+        ]
+        result = handle_coupling(mock_storage, "src/auth/login.py")
+        assert "hidden" in result.lower()
+
+    def test_no_coupling_found(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [[], []]
+        result = handle_coupling(mock_storage, "src/isolated.py")
+        assert "No temporal coupling" in result
+
+    def test_min_strength_filter(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [["src/weak.py", 0.2, 2]],
+            [],
+        ]
+        result = handle_coupling(mock_storage, "src/a.py", min_strength=0.3)
+        assert "No temporal coupling" in result
+
+    def test_empty_file_path(self, mock_storage):
+        result = handle_coupling(mock_storage, "")
+        assert "required" in result.lower()
+
+
+class TestHandleCommunities:
+    def test_list_all_communities(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [
+                ["ingestion+storage", 0.72, '{"symbol_count": 23}'],
+                ["mcp+server", 0.65, '{"symbol_count": 15}'],
+            ],
+            [],  # Cross-community processes
+        ]
+        result = handle_communities(mock_storage)
+        assert "ingestion+storage" in result
+        assert "0.72" in result
+        assert "23" in result
+        assert "mcp+server" in result
+
+    def test_drill_into_community(self, mock_storage):
+        mock_storage.execute_raw.return_value = [
+            ["run_pipeline", "Function", "src/pipeline.py", 45, True, False],
+            ["KuzuBackend", "Class", "src/storage.py", 10, False, True],
+        ]
+        result = handle_communities(mock_storage, community="ingestion+storage")
+        assert "run_pipeline" in result
+        assert "entry point" in result.lower()
+        assert "KuzuBackend" in result
+
+    def test_no_communities(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [[], []]
+        result = handle_communities(mock_storage)
+        assert "No communities" in result
+
+    def test_community_not_found(self, mock_storage):
+        mock_storage.execute_raw.return_value = []
+        result = handle_communities(mock_storage, community="nonexistent")
+        assert "not found" in result.lower()
+
+
+class TestHandleExplain:
+    def test_basic_explanation(self, mock_storage):
+        mock_storage.get_node.return_value = GraphNode(
+            id="function:src/pipeline.py:run_pipeline",
+            label=NodeLabel.FUNCTION,
+            name="run_pipeline",
+            file_path="src/pipeline.py",
+            start_line=45,
+            end_line=120,
+            is_entry_point=True,
+            is_exported=True,
+        )
+        mock_storage.get_callers_with_confidence.return_value = [
+            (GraphNode(id="f:cli.py:main", label=NodeLabel.FUNCTION, name="main",
+                       file_path="src/cli.py", start_line=1, end_line=10), 1.0),
+        ]
+        mock_storage.get_callees_with_confidence.return_value = [
+            (GraphNode(id="f:walk.py:walk", label=NodeLabel.FUNCTION, name="walk",
+                       file_path="src/walk.py", start_line=1, end_line=10), 0.9),
+            (GraphNode(id="f:parse.py:parse", label=NodeLabel.FUNCTION, name="parse",
+                       file_path="src/parse.py", start_line=1, end_line=10), 0.8),
+        ]
+        mock_storage.execute_raw.side_effect = [
+            [["ingestion+storage"]],  # Community membership
+            [["run → walk → parse", 1]],  # Process flows
+        ]
+
+        result = handle_explain(mock_storage, "run_pipeline")
+        assert "run_pipeline" in result
+        assert "Entry point" in result
+        assert "Exported" in result
+        assert "ingestion+storage" in result
+        assert "Called by 1" in result
+        assert "main" in result
+        assert "Calls 2" in result
+
+    def test_symbol_not_found(self, mock_storage):
+        mock_storage.exact_name_search.return_value = []
+        mock_storage.fts_search.return_value = []
+        result = handle_explain(mock_storage, "nonexistent")
+        assert "not found" in result.lower()
+
+    def test_empty_symbol(self, mock_storage):
+        result = handle_explain(mock_storage, "")
+        assert "required" in result.lower()
+
+    def test_dead_code_symbol(self, mock_storage):
+        mock_storage.get_node.return_value = GraphNode(
+            id="function:src/old.py:old_func",
+            label=NodeLabel.FUNCTION,
+            name="old_func",
+            file_path="src/old.py",
+            start_line=1,
+            end_line=10,
+            is_dead=True,
+        )
+        mock_storage.get_callers_with_confidence.return_value = []
+        mock_storage.get_callees_with_confidence.return_value = []
+        mock_storage.execute_raw.side_effect = [[], []]
+
+        result = handle_explain(mock_storage, "old_func")
+        assert "dead code" in result.lower() or "Dead code" in result
+
+
+class TestHandleReviewRisk:
+    def test_basic_risk_assessment(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            # Symbols in changed file
+            [["function:src/auth.py:validate", "validate", "src/auth.py", 10, 30]],
+            # Coupling for src/auth.py
+            [["src/tests/test_auth.py", 0.82]],
+            # Community for validate
+            [["auth+security"]],
+        ]
+        mock_storage.get_node.return_value = GraphNode(
+            id="function:src/auth.py:validate",
+            label=NodeLabel.FUNCTION,
+            name="validate",
+            file_path="src/auth.py",
+            start_line=10,
+            end_line=30,
+            is_entry_point=False,
+        )
+        mock_storage.traverse_with_depth.return_value = [
+            (GraphNode(id="f:api.py:login", label=NodeLabel.FUNCTION, name="login",
+                       file_path="src/api.py", start_line=5, end_line=20), 1),
+        ]
+
+        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
+        assert "Risk" in result
+        assert "validate" in result
+
+    def test_flags_missing_cochange_files(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [["function:src/auth.py:validate", "validate", "src/auth.py", 10, 30]],
+            [["src/tests/test_auth.py", 0.82]],
+            [["auth"]],
+        ]
+        mock_storage.get_node.return_value = GraphNode(
+            id="function:src/auth.py:validate",
+            label=NodeLabel.FUNCTION,
+            name="validate",
+            file_path="src/auth.py",
+            start_line=10,
+            end_line=30,
+        )
+        mock_storage.traverse_with_depth.return_value = []
+        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
+        assert "test_auth.py" in result
+        assert "missing" in result.lower() or "usually change" in result.lower()
+
+    def test_empty_diff(self, mock_storage):
+        result = handle_review_risk(mock_storage, "")
+        assert "Empty diff" in result
+
+    def test_no_affected_symbols(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [],  # No symbols in changed file
+            [],  # No coupling
+        ]
+        result = handle_review_risk(mock_storage, SAMPLE_DIFF)
+        assert "No indexed symbols" in result or "LOW" in result
+
+
+class TestHandleCallPath:
+    def test_direct_path(self, mock_storage):
+        """Two symbols where A calls B directly."""
+        _callee = GraphNode(
+            id="function:src/perms.py:check_perms",
+            label=NodeLabel.FUNCTION,
+            name="check_perms",
+            file_path="src/perms.py",
+            start_line=25,
+            end_line=40,
+        )
+        mock_storage.get_callees.return_value = [_callee]
+        # Need separate fts_search results for from and to symbols
+        mock_storage.fts_search.side_effect = [
+            [SearchResult(node_id="function:src/auth.py:validate", score=1.0, node_name="validate")],
+            [SearchResult(node_id="function:src/perms.py:check_perms", score=1.0, node_name="check_perms")],
+        ]
+        mock_storage.get_node.side_effect = [
+            GraphNode(id="function:src/auth.py:validate", label=NodeLabel.FUNCTION,
+                      name="validate", file_path="src/auth.py", start_line=10, end_line=30),
+            GraphNode(id="function:src/perms.py:check_perms", label=NodeLabel.FUNCTION,
+                      name="check_perms", file_path="src/perms.py", start_line=25, end_line=40),
+            # get_node calls during path reconstruction
+            GraphNode(id="function:src/auth.py:validate", label=NodeLabel.FUNCTION,
+                      name="validate", file_path="src/auth.py", start_line=10, end_line=30),
+            GraphNode(id="function:src/perms.py:check_perms", label=NodeLabel.FUNCTION,
+                      name="check_perms", file_path="src/perms.py", start_line=25, end_line=40),
+        ]
+        result = handle_call_path(mock_storage, "validate", "check_perms")
+        assert "validate" in result
+        assert "check_perms" in result
+        assert "1 hop" in result
+        assert "→" in result
+
+    def test_no_path_found(self, mock_storage):
+        mock_storage.get_callees.return_value = []
+        mock_storage.fts_search.side_effect = [
+            [SearchResult(node_id="function:src/a.py:foo", score=1.0, node_name="foo")],
+            [SearchResult(node_id="function:src/b.py:bar", score=1.0, node_name="bar")],
+        ]
+        mock_storage.get_node.side_effect = [
+            GraphNode(id="function:src/a.py:foo", label=NodeLabel.FUNCTION,
+                      name="foo", file_path="src/a.py", start_line=1, end_line=10),
+            GraphNode(id="function:src/b.py:bar", label=NodeLabel.FUNCTION,
+                      name="bar", file_path="src/b.py", start_line=1, end_line=10),
+        ]
+        result = handle_call_path(mock_storage, "foo", "bar")
+        assert "No call path found" in result
+
+    def test_same_symbol(self, mock_storage):
+        mock_storage.fts_search.return_value = [
+            SearchResult(node_id="function:src/a.py:foo", score=1.0, node_name="foo"),
+        ]
+        mock_storage.get_node.return_value = GraphNode(
+            id="function:src/a.py:foo", label=NodeLabel.FUNCTION,
+            name="foo", file_path="src/a.py", start_line=1, end_line=10,
+        )
+        result = handle_call_path(mock_storage, "foo", "foo")
+        assert "same symbol" in result.lower()
+
+    def test_empty_from_symbol(self, mock_storage):
+        result = handle_call_path(mock_storage, "", "bar")
+        assert "required" in result.lower()
+
+    def test_empty_to_symbol(self, mock_storage):
+        result = handle_call_path(mock_storage, "foo", "")
+        assert "required" in result.lower()
+
+    def test_source_not_found(self, mock_storage):
+        mock_storage.exact_name_search.return_value = []
+        mock_storage.fts_search.side_effect = [
+            [],  # from_symbol not found
+        ]
+        result = handle_call_path(mock_storage, "nonexistent", "bar")
+        assert "not found" in result.lower()
+
+
+class TestHandleFileContext:
+    def test_full_file_context(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            # Symbols
+            [
+                ["handle_query", "Function", 170, False, True, False],
+                ["handle_context", "Function", 197, False, False, False],
+            ],
+            # Imports out
+            [["src/storage/base.py"], ["src/search/hybrid.py"]],
+            # Imported by
+            [["src/mcp/server.py"]],
+            # Coupling
+            [["tests/mcp/test_tools.py", 0.85, 12]],
+            # Dead code
+            [],
+            # Communities
+            [["mcp+server", 2]],
+        ]
+        result = handle_file_context(mock_storage, "src/mcp/tools.py")
+        assert "src/mcp/tools.py" in result
+        assert "handle_query" in result
+        assert "entry point" in result.lower()
+        assert "Imports (2)" in result
+        assert "Imported by (1)" in result
+        assert "test_tools.py" in result
+        assert "0.85" in result
+        assert "mcp+server" in result
+
+    def test_empty_file(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [[], [], [], [], [], []]
+        result = handle_file_context(mock_storage, "src/empty.py")
+        assert "No data found" in result
+
+    def test_file_with_dead_code(self, mock_storage):
+        mock_storage.execute_raw.side_effect = [
+            [["old_func", "Function", 45, True, False, False]],
+            [], [], [],
+            [["old_func", 45, "Function"]],
+            [],
+        ]
+        result = handle_file_context(mock_storage, "src/old.py")
+        assert "Dead code" in result
+        assert "old_func" in result
+
+    def test_empty_file_path(self, mock_storage):
+        result = handle_file_context(mock_storage, "")
+        assert "required" in result.lower()
+
+
+class TestHandleTestImpact:
+    def test_finds_test_callers_via_diff(self, mock_storage):
+        # Changed symbol in diff
+        mock_storage.execute_raw.return_value = [
+            ["function:src/auth.py:validate", "validate", 10, 30],
+        ]
+        # Test function that calls validate
+        _test_caller = GraphNode(
+            id="function:tests/test_auth.py:test_validate",
+            label=NodeLabel.FUNCTION,
+            name="test_validate",
+            file_path="tests/test_auth.py",
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_test_caller, 1)]
+
+        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
+        assert "test_validate" in result
+        assert "tests/test_auth.py" in result
+        assert "validate" in result
+
+    def test_finds_test_callers_via_symbols(self, mock_storage):
+        _test_caller = GraphNode(
+            id="function:tests/test_auth.py:test_validate",
+            label=NodeLabel.FUNCTION,
+            name="test_validate",
+            file_path="tests/test_auth.py",
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_test_caller, 1)]
+
+        result = handle_test_impact(mock_storage, symbols=["validate"])
+        assert "test_validate" in result
+        assert "tests/test_auth.py" in result
+
+    def test_no_tests_found(self, mock_storage):
+        mock_storage.execute_raw.return_value = [
+            ["function:src/auth.py:validate", "validate", 10, 30],
+        ]
+        # Non-test caller
+        _caller = GraphNode(
+            id="function:src/api.py:login",
+            label=NodeLabel.FUNCTION,
+            name="login",
+            file_path="src/api.py",
+            start_line=5,
+            end_line=20,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_caller, 1)]
+
+        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
+        assert "No test files found" in result
+
+    def test_no_params(self, mock_storage):
+        result = handle_test_impact(mock_storage)
+        assert "provide either" in result.lower()
+
+    def test_transitive_test(self, mock_storage):
+        mock_storage.execute_raw.return_value = [
+            ["function:src/auth.py:validate", "validate", 10, 30],
+        ]
+        _test_caller = GraphNode(
+            id="function:tests/e2e/test_full.py:test_e2e",
+            label=NodeLabel.FUNCTION,
+            name="test_e2e",
+            file_path="tests/e2e/test_full.py",
+            start_line=5,
+            end_line=15,
+        )
+        mock_storage.traverse_with_depth.return_value = [(_test_caller, 3)]
+
+        result = handle_test_impact(mock_storage, diff=SAMPLE_DIFF)
+        assert "indirect" in result.lower() or "transitive" in result.lower()
+        assert "test_e2e" in result
+
+
+class TestHandleCycles:
+    def test_no_cycles(self, mock_storage):
+        """Graph with no cycles returns clean message."""
+        kg = KnowledgeGraph()
+        # Add 3 nodes with no cycles: A -> B -> C
+        a = GraphNode(id="function:a.py:a", label=NodeLabel.FUNCTION, name="a",
+                      file_path="a.py", start_line=1, end_line=5)
+        b = GraphNode(id="function:b.py:b", label=NodeLabel.FUNCTION, name="b",
+                      file_path="b.py", start_line=1, end_line=5)
+        c = GraphNode(id="function:c.py:c", label=NodeLabel.FUNCTION, name="c",
+                      file_path="c.py", start_line=1, end_line=5)
+        kg.add_node(a)
+        kg.add_node(b)
+        kg.add_node(c)
+        kg.add_relationship(GraphRelationship(
+            id="r1", type=RelType.CALLS, source=a.id, target=b.id))
+        kg.add_relationship(GraphRelationship(
+            id="r2", type=RelType.CALLS, source=b.id, target=c.id))
+
+        mock_storage.load_graph.return_value = kg
+
+        result = handle_cycles(mock_storage)
+        assert "No circular dependencies" in result
+
+    def test_detects_cycle(self, mock_storage):
+        """Graph with A -> B -> A cycle is detected."""
+        kg = KnowledgeGraph()
+        a = GraphNode(id="function:a.py:a", label=NodeLabel.FUNCTION, name="a",
+                      file_path="a.py", start_line=1, end_line=5)
+        b = GraphNode(id="function:b.py:b", label=NodeLabel.FUNCTION, name="b",
+                      file_path="b.py", start_line=1, end_line=5)
+        kg.add_node(a)
+        kg.add_node(b)
+        kg.add_relationship(GraphRelationship(
+            id="r1", type=RelType.CALLS, source=a.id, target=b.id))
+        kg.add_relationship(GraphRelationship(
+            id="r2", type=RelType.CALLS, source=b.id, target=a.id))
+
+        mock_storage.load_graph.return_value = kg
+
+        result = handle_cycles(mock_storage)
+        assert "Circular Dependencies" in result
+        assert "1 groups" in result or "Cycle 1" in result
+        assert "a" in result
+        assert "b" in result
+
+    def test_critical_large_cycle(self, mock_storage):
+        """Cycles with 5+ symbols are marked CRITICAL."""
+        kg = KnowledgeGraph()
+        nodes = []
+        for i in range(5):
+            n = GraphNode(id=f"function:{i}.py:f{i}", label=NodeLabel.FUNCTION,
+                          name=f"f{i}", file_path=f"{i}.py", start_line=1, end_line=5)
+            kg.add_node(n)
+            nodes.append(n)
+        # Create cycle: f0 -> f1 -> f2 -> f3 -> f4 -> f0
+        for i in range(5):
+            kg.add_relationship(GraphRelationship(
+                id=f"r{i}", type=RelType.CALLS,
+                source=nodes[i].id, target=nodes[(i + 1) % 5].id))
+
+        mock_storage.load_graph.return_value = kg
+
+        result = handle_cycles(mock_storage)
+        assert "CRITICAL" in result
+
+    def test_load_graph_error(self, mock_storage):
+        mock_storage.load_graph.side_effect = RuntimeError("DB error")
+        result = handle_cycles(mock_storage)
+        assert "Error loading graph" in result
+
+    def test_empty_graph(self, mock_storage):
+        kg = KnowledgeGraph()
+        mock_storage.load_graph.return_value = kg
+        result = handle_cycles(mock_storage)
+        assert "No symbols" in result

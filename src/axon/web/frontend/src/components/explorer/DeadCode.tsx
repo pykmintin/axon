@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { analysisApi } from '@/api/client';
+import { errorMessage } from '@/lib/utils';
 import { useGraphStore } from '@/stores/graphStore';
 import type { DeadCodeReport, DeadCodeEntry } from '@/types';
 import { TypeBadge } from '@/components/shared/TypeBadge';
@@ -26,7 +27,7 @@ export function DeadCode() {
         }
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) setError(errorMessage(err, 'Failed to load dead code'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -240,4 +241,3 @@ function FileGroup({
     </div>
   );
 }
-

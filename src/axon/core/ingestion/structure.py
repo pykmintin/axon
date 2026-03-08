@@ -7,7 +7,6 @@ knowledge graph with File and Folder nodes connected by CONTAINS relationships.
 from __future__ import annotations
 
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import (
@@ -17,27 +16,12 @@ from axon.core.graph.model import (
     RelType,
     generate_id,
 )
+from axon.core.ingestion.walker import FileEntry
 
-if TYPE_CHECKING:
-    from axon.core.ingestion.walker import FileEntry
 
 def process_structure(files: list[FileEntry], graph: KnowledgeGraph) -> None:
-    """Build File/Folder nodes and CONTAINS relationships from a list of files.
-
-    For every file entry a :pyclass:`NodeLabel.FILE` node is created.  Every
-    unique directory that appears in any file path produces a
-    :pyclass:`NodeLabel.FOLDER` node.  Parent-child folder relationships and
-    folder-to-file relationships are expressed as :pyclass:`RelType.CONTAINS`
-    edges.
-
-    Args:
-        files: File entries to process.  Each entry carries the relative path,
-            raw content, and detected language.
-        graph: The knowledge graph to populate.  Nodes and relationships are
-            **added** (existing content is not removed).
-    """
+    """Build File/Folder nodes and CONTAINS relationships from a list of files."""
     folder_paths: set[str] = set()
-
     for file_info in files:
         pure = PurePosixPath(file_info.path)
         for parent in pure.parents:
@@ -57,6 +41,19 @@ def process_structure(files: list[FileEntry], graph: KnowledgeGraph) -> None:
                     file_path=dir_path,
                 )
             )
+        dir_pure = PurePosixPath(dir_path)
+        parent_str = str(dir_pure.parent)
+        if parent_str != ".":
+            parent_id = generate_id(NodeLabel.FOLDER, parent_str)
+            rel_id = f"contains:{parent_id}->{folder_id}"
+            graph.add_relationship(
+                GraphRelationship(
+                    id=rel_id,
+                    type=RelType.CONTAINS,
+                    source=parent_id,
+                    target=folder_id,
+                )
+            )
 
     for file_info in files:
         file_id = generate_id(NodeLabel.FILE, file_info.path)
@@ -70,41 +67,15 @@ def process_structure(files: list[FileEntry], graph: KnowledgeGraph) -> None:
                 language=file_info.language,
             )
         )
-
-    # Folder -> Folder (parent contains child)
-    for dir_path in folder_paths:
-        pure = PurePosixPath(dir_path)
-        parent_str = str(pure.parent)
-        if parent_str == ".":
-            # Top-level folder has no parent — skip.
-            continue
-        parent_id = generate_id(NodeLabel.FOLDER, parent_str)
-        child_id = generate_id(NodeLabel.FOLDER, dir_path)
-        rel_id = f"contains:{parent_id}->{child_id}"
-        graph.add_relationship(
-            GraphRelationship(
-                id=rel_id,
-                type=RelType.CONTAINS,
-                source=parent_id,
-                target=child_id,
+        parent_str = str(PurePosixPath(file_info.path).parent)
+        if parent_str != ".":
+            parent_id = generate_id(NodeLabel.FOLDER, parent_str)
+            rel_id = f"contains:{parent_id}->{file_id}"
+            graph.add_relationship(
+                GraphRelationship(
+                    id=rel_id,
+                    type=RelType.CONTAINS,
+                    source=parent_id,
+                    target=file_id,
+                )
             )
-        )
-
-    # Folder -> File (immediate parent folder contains file)
-    for file_info in files:
-        pure = PurePosixPath(file_info.path)
-        parent_str = str(pure.parent)
-        if parent_str == ".":
-            # Root-level file — no containing folder.
-            continue
-        parent_id = generate_id(NodeLabel.FOLDER, parent_str)
-        file_id = generate_id(NodeLabel.FILE, file_info.path)
-        rel_id = f"contains:{parent_id}->{file_id}"
-        graph.add_relationship(
-            GraphRelationship(
-                id=rel_id,
-                type=RelType.CONTAINS,
-                source=parent_id,
-                target=file_id,
-            )
-        )

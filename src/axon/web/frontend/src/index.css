@@ -40,17 +40,17 @@
   --orange: #f0883e;
   --yellow: #d4a72c;
 
-  /* Graph Node Colors (hue-separated, equal brightness) */
-  --node-function: #6FA8DC;
-  --node-class: #3D85C6;
-  --node-method: #9FC5E8;
-  --node-interface: #8E7CC3;
-  --node-typealias: #B4A7D6;
-  --node-enum: #674EA7;
-  --node-file: #7F8C8D;
-  --node-folder: #566573;
-  --node-community: #D4AC0D;
-  --node-process: #48C9B0;
+  /* Graph Node Colors — matches graphAdapter.ts palette */
+  --node-function: #39D353;
+  --node-class: #F5A623;
+  --node-method: #58A6FF;
+  --node-interface: #00BCD4;
+  --node-typealias: #B455E0;
+  --node-enum: #E85D75;
+  --node-file: #8B949E;
+  --node-folder: #D2A35C;
+  --node-community: #3FB950;
+  --node-process: #F78166;
 
   /* Radius — terminal-sharp (spec 3.4) */
   --radius: 2px;

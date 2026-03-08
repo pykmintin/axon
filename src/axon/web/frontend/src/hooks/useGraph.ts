@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { MultiDirectedGraph } from 'graphology';
 import { analysisApi, graphApi } from '@/api/client';
 import { buildGraphology } from '@/lib/graphAdapter';
+import { errorMessage } from '@/lib/utils';
 import { useDataStore } from '@/stores/dataStore';
 import { useGraphStore } from '@/stores/graphStore';
 
@@ -49,7 +50,7 @@ export function useGraph(): UseGraphReturn {
         if (healthResp) setHealthScore(healthResp);
       } catch (e) {
         if (!cancelled) {
-          setError(e instanceof Error ? e.message : 'Failed to load graph');
+          setError(errorMessage(e, 'Failed to load graph'));
         }
       } finally {
         if (!cancelled) {

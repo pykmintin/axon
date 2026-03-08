@@ -10,3 +10,7 @@ export function shortPath(filePath: string): string {
   if (parts.length <= 2) return filePath;
   return parts.slice(-2).join('/');
 }
+
+export function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}

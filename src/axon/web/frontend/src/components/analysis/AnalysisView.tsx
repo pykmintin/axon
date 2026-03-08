@@ -6,6 +6,7 @@ import type {
 } from '@/types';
 import { useGraphStore } from '@/stores/graphStore';
 import { useDataStore } from '@/stores/dataStore';
+import { errorMessage } from '@/lib/utils';
 import { HealthScore } from './HealthScore';
 import { QuickStats } from './QuickStats';
 import { DeadCodeReport } from './DeadCodeReport';
@@ -36,6 +37,9 @@ const HEADING_STYLE: React.CSSProperties = {
   flexShrink: 0,
 };
 
+const EMPTY_COUPLING: { pairs: CouplingPair[] } = { pairs: [] };
+const EMPTY_PROCESSES: { processes: Process[] } = { processes: [] };
+
 function Card({
   title,
   children,
@@ -58,13 +62,11 @@ function Card({
 }
 
 export function AnalysisView() {
-  // Read data already loaded by useGraph (avoids duplicate API calls)
   const overview = useGraphStore((s) => s.overview);
   const communities = useGraphStore((s) => s.communities);
   const healthScore = useDataStore((s) => s.healthScore);
   const deadCode = useDataStore((s) => s.deadCode);
 
-  // Only fetch the two data sets that useGraph doesn't load
   const [coupling, setCoupling] = useState<CouplingPair[]>([]);
   const [processes, setProcesses] = useState<Process[]>([]);
   const [loading, setLoading] = useState(true);
@@ -76,16 +78,16 @@ export function AnalysisView() {
     setError(null);
 
     Promise.all([
-      analysisApi.getCoupling().catch(() => ({ pairs: [] as CouplingPair[] })),
-      analysisApi.getProcesses().catch(() => ({ processes: [] as Process[] })),
+      analysisApi.getCoupling().catch(() => EMPTY_COUPLING),
+      analysisApi.getProcesses().catch(() => EMPTY_PROCESSES),
     ])
       .then(([couplingResp, procResp]) => {
         if (cancelled) return;
-        setCoupling(couplingResp?.pairs ?? []);
-        setProcesses(procResp?.processes ?? []);
+        setCoupling(couplingResp.pairs);
+        setProcesses(procResp.processes);
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) setError(errorMessage(err, 'Failed to load analysis data'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -124,7 +126,6 @@ export function AnalysisView() {
         opacity: 1,
       }}
     >
-      {/* Row 1 */}
       <Card title="Health Score">
         <HealthScore data={healthScore} />
       </Card>
@@ -139,7 +140,6 @@ export function AnalysisView() {
         />
       </Card>
 
-      {/* Row 2 */}
       <Card title="Dead Code Report" style={{ gridColumn: 'span 1' }}>
         <DeadCodeReport data={deadCode} />
       </Card>
@@ -147,7 +147,6 @@ export function AnalysisView() {
         <CouplingHeatmap pairs={coupling} />
       </Card>
 
-      {/* Row 3 */}
       <Card title="Inheritance Tree" style={{ gridColumn: 'span 1' }} loading={loading}>
         <InheritanceTree />
       </Card>

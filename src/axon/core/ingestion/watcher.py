@@ -18,10 +18,18 @@ import subprocess
 import time
 from pathlib import Path
 
+import watchfiles
+
 from axon.config.ignore import load_gitignore, should_ignore
 from axon.config.languages import is_supported
+from axon.core.embeddings.embedder import embed_nodes
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import NodeLabel, RelType
+from axon.core.ingestion.community import process_communities
+from axon.core.ingestion.coupling import process_coupling
+from axon.core.ingestion.dead_code import process_dead_code
+from axon.core.ingestion.pipeline import reindex_files
+from axon.core.ingestion.processes import process_processes
 from axon.core.ingestion.walker import FileEntry, read_file
 from axon.core.storage.base import StorageBackend
 
@@ -65,8 +73,6 @@ def _reindex_files(
 
     Returns (count_reindexed, set_of_relative_file_paths_reindexed).
     """
-    from axon.core.ingestion.pipeline import reindex_files
-
     entries: list[FileEntry] = []
     reindexed_paths: set[str] = set()
 
@@ -97,7 +103,7 @@ def _reindex_files(
             reindexed_paths.add(relative)
 
     if entries:
-        reindex_files(entries, repo_path, storage)
+        reindex_files(entries, repo_path, storage, rebuild_fts=False)
 
     return len(reindexed_paths), reindexed_paths
 
@@ -119,44 +125,54 @@ def _compute_dirty_node_ids(graph: KnowledgeGraph, dirty_files: set[str]) -> set
     return dirty_node_ids | neighbor_ids
 
 
+_SMALL_CHANGE_THRESHOLD = 3
+
+
 def _run_incremental_global_phases(
     storage: StorageBackend,
     repo_path: Path,
     dirty_files: set[str],
     run_coupling: bool = False,
 ) -> None:
-    """Run global phases incrementally using graph hydrated from storage."""
-    from axon.core.ingestion.community import process_communities
-    from axon.core.ingestion.coupling import process_coupling
-    from axon.core.ingestion.dead_code import process_dead_code
-    from axon.core.ingestion.processes import process_processes
-    from axon.core.embeddings.embedder import embed_nodes
+    """Run global phases incrementally using graph hydrated from storage.
 
-    storage.delete_synthetic_nodes()
+    When the change is small (< _SMALL_CHANGE_THRESHOLD files), only dead code
+    detection runs (communities and processes are expensive and unlikely to
+    shift from a 1-2 file change).
+    """
+    small_change = len(dirty_files) < _SMALL_CHANGE_THRESHOLD
+
+    if not small_change:
+        storage.delete_synthetic_nodes()
 
     logger.info("Hydrating graph from storage...")
     graph = storage.load_graph()
-    num_communities = process_communities(graph)
-    logger.info("Communities: %d", num_communities)
 
-    num_processes = process_processes(graph)
-    logger.info("Processes: %d", num_processes)
+    if not small_change:
+        num_communities = process_communities(graph)
+        logger.info("Communities: %d", num_communities)
+
+        num_processes = process_processes(graph)
+        logger.info("Processes: %d", num_processes)
+    else:
+        logger.info("Small change (%d files) — skipping communities/processes", len(dirty_files))
 
     num_dead = process_dead_code(graph)
     logger.info("Dead code: %d", num_dead)
 
-    new_nodes = (
-        list(graph.get_nodes_by_label(NodeLabel.COMMUNITY))
-        + list(graph.get_nodes_by_label(NodeLabel.PROCESS))
-    )
-    new_rels = (
-        list(graph.get_relationships_by_type(RelType.MEMBER_OF))
-        + list(graph.get_relationships_by_type(RelType.STEP_IN_PROCESS))
-    )
-    if new_nodes:
-        storage.add_nodes(new_nodes)
-    if new_rels:
-        storage.add_relationships(new_rels)
+    if not small_change:
+        new_nodes = (
+            list(graph.get_nodes_by_label(NodeLabel.COMMUNITY))
+            + list(graph.get_nodes_by_label(NodeLabel.PROCESS))
+        )
+        new_rels = (
+            list(graph.get_relationships_by_type(RelType.MEMBER_OF))
+            + list(graph.get_relationships_by_type(RelType.STEP_IN_PROCESS))
+        )
+        if new_nodes:
+            storage.add_nodes(new_nodes)
+        if new_rels:
+            storage.add_relationships(new_rels)
 
     dead_ids = {n.id for n in graph.iter_nodes() if n.is_dead}
     alive_ids = {n.id for n in graph.iter_nodes() if not n.is_dead}
@@ -199,8 +215,6 @@ async def watch_repo(
     period of QUIET_PERIOD seconds with no new changes. Coupling runs
     only when new git commits are detected.
     """
-    import watchfiles
-
     async def _run_sync(fn, *args):
         if lock is not None:
             async with lock:
@@ -222,7 +236,6 @@ async def watch_repo(
         yield_on_timeout=True,
         stop_event=stop_event,
     ):
-        # --- Tier 1: Immediate file-local reindex ---
         changed_paths: list[Path] = []
         seen: set[str] = set()
         for _change_type, path_str in changes:
@@ -241,7 +254,6 @@ async def watch_repo(
                     first_dirty_time = last_change_time
                 logger.info("Reindexed %d file(s), %d paths dirty", count, len(reindexed))
 
-        # --- Tier 2: Debounced global phases ---
         now = time.monotonic()
         quiet_elapsed = last_change_time > 0 and (now - last_change_time) >= QUIET_PERIOD
         starvation = first_dirty_time > 0 and (now - first_dirty_time) >= MAX_DIRTY_AGE

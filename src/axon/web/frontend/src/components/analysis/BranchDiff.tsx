@@ -4,7 +4,7 @@ import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore } from '@/stores/viewStore';
 import type { DiffResult, GraphNode, ModifiedNodePair } from '@/types';
 import { TypeBadge } from '@/components/shared/TypeBadge';
-import { shortPath } from '@/lib/utils';
+import { errorMessage, shortPath } from '@/lib/utils';
 
 function NodeRow({
   node,
@@ -74,7 +74,7 @@ export function BranchDiff() {
       const data = await diffApi.compare(base.trim(), compare.trim());
       setResult(data);
     } catch (err: unknown) {
-      setError(String(err));
+      setError(errorMessage(err, 'Failed to compare branches'));
     } finally {
       setLoading(false);
     }
@@ -103,7 +103,6 @@ export function BranchDiff() {
 
   return (
     <div style={{ padding: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-      {/* Input row */}
       <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
         <input
           type="text"
@@ -172,7 +171,6 @@ export function BranchDiff() {
         </button>
       </div>
 
-      {/* Error */}
       {error && (
         <div
           style={{
@@ -185,10 +183,8 @@ export function BranchDiff() {
         </div>
       )}
 
-      {/* Results */}
       {result && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          {/* Summary bar */}
           <div
             style={{
               display: 'flex',
@@ -203,7 +199,6 @@ export function BranchDiff() {
             <span style={{ color: 'var(--warning)' }}>~{modifiedCount} modified</span>
           </div>
 
-          {/* Open in explorer button */}
           <button
             onClick={handleOpenInExplorer}
             style={{
@@ -221,7 +216,6 @@ export function BranchDiff() {
             Open in Explorer
           </button>
 
-          {/* Added */}
           {addedCount > 0 && (
             <Section title="Added" color="var(--accent)">
               {result.added.map((node) => (
@@ -235,7 +229,6 @@ export function BranchDiff() {
             </Section>
           )}
 
-          {/* Removed */}
           {removedCount > 0 && (
             <Section title="Removed" color="var(--danger)">
               {result.removed.map((node) => (
@@ -249,7 +242,6 @@ export function BranchDiff() {
             </Section>
           )}
 
-          {/* Modified */}
           {modifiedCount > 0 && (
             <Section title="Modified" color="var(--warning)">
               {result.modified.map((pair: ModifiedNodePair) => (
@@ -263,7 +255,6 @@ export function BranchDiff() {
             </Section>
           )}
 
-          {/* Empty result */}
           {addedCount === 0 && removedCount === 0 && modifiedCount === 0 && (
             <div
               style={{

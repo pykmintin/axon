@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { analysisApi } from '@/api/client';
+import { errorMessage } from '@/lib/utils';
 import { useGraphStore } from '@/stores/graphStore';
 import type { Community } from '@/types';
 import { TypeBadge } from '@/components/shared/TypeBadge';
@@ -40,7 +41,7 @@ export function Communities() {
         }
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) setError(errorMessage(err, 'Failed to load communities'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -304,4 +305,3 @@ function MemberRow({ member }: { member: { id: string; name: string; label: stri
     </div>
   );
 }
-

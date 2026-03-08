@@ -47,10 +47,8 @@ def hybrid_search(
 
     candidate_limit = min(limit * 3, 300)
 
-    # Step 1: gather ranked lists from each source
     fts_results = storage.fts_search(query, limit=candidate_limit)
 
-    # Fuzzy fallback: if BM25 returns nothing, try Levenshtein name matching.
     if not fts_results and hasattr(storage, "fuzzy_search"):
         fts_results = storage.fuzzy_search(query, limit=candidate_limit)
 
@@ -97,6 +95,5 @@ def _accumulate_ranks(
         rank_1 = rank_0 + 1  # 1-based rank
         scores[nid] = scores.get(nid, 0.0) + weight / (k + rank_1)
 
-        # Keep the first metadata we encounter for this node
         if nid not in metadata:
             metadata[nid] = result

@@ -1,4 +1,4 @@
-import { Hexagon, RotateCw } from 'lucide-react';
+import { RotateCw } from 'lucide-react';
 import { useGraphStore } from '@/stores/graphStore';
 import { useViewStore, type ActiveView } from '@/stores/viewStore';
 import { cn } from '@/lib/utils';
@@ -28,7 +28,11 @@ export function Header() {
       }}
     >
       <div className="flex items-center gap-2">
-        <Hexagon size={14} style={{ color: 'var(--accent)' }} />
+        <img
+          src="/axon-logo.png"
+          alt="Axon"
+          className="h-6 w-auto"
+        />
         <span
           className="view-title"
           style={{ color: 'var(--accent)', fontSize: 14 }}

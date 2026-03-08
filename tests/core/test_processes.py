@@ -17,6 +17,8 @@ from axon.core.ingestion.processes import (
     process_processes,
     trace_flow,
 )
+
+
 def _add_function(
     graph: KnowledgeGraph,
     name: str,

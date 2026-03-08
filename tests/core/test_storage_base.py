@@ -133,6 +133,12 @@ class TestStorageBackend:
             def delete_synthetic_nodes(self):
                 pass
 
+            def get_file_index(self):
+                return {}
+
+            def get_symbol_name_index(self):
+                return {}
+
             def upsert_embeddings(self, embeddings):
                 pass
 

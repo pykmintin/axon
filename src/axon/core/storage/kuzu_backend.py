@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import logging
 import math
 import tempfile
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -55,8 +57,11 @@ _NODE_PROPERTIES = (
     "is_entry_point BOOL, "
     "is_exported BOOL, "
     "cohesion DOUBLE, "
+    "properties_json STRING, "
     "PRIMARY KEY (id)"
 )
+
+_DEDICATED_PROPS = frozenset({"cohesion"})
 
 _REL_PROPERTIES = (
     "rel_type STRING, "
@@ -67,6 +72,13 @@ _REL_PROPERTIES = (
     "co_changes INT64, "
     "symbols STRING"
 )
+
+def _serialize_extra_props(props: dict[str, Any] | None) -> str:
+    if not props:
+        return ""
+    extra = {k: v for k, v in props.items() if k not in _DEDICATED_PROPS}
+    return json.dumps(extra) if extra else ""
+
 
 def escape_cypher(value: str) -> str:
     """Escape a string for safe inclusion in a Cypher literal."""
@@ -118,27 +130,39 @@ class KuzuBackend:
             raise RuntimeError("KuzuBackend.initialize() must be called before use")
         return self._conn
 
-    def initialize(self, path: Path, *, read_only: bool = False) -> None:
-        """Open or create the KuzuDB database at *path* and set up the schema.
+    def initialize(
+        self,
+        path: Path,
+        *,
+        read_only: bool = False,
+        max_retries: int = 0,
+        retry_delay: float = 0.3,
+    ) -> None:
+        """Open or create the KuzuDB database at *path*.
 
-        Args:
-            path: Filesystem path to the KuzuDB database directory.
-            read_only: If ``True``, open the database in read-only mode.
-                This allows multiple concurrent readers (e.g. MCP server
-                instances) without lock conflicts.  Schema creation is
-                skipped since the database must already exist.
+        In read-only mode, schema creation is skipped (database must already exist).
+        Retries on lock contention errors with exponential backoff.
         """
-        self._db = kuzu.Database(str(path), read_only=read_only)
-        self._conn = kuzu.Connection(self._db)
-        if not read_only:
-            self._create_schema()
+        for attempt in range(max_retries + 1):
+            try:
+                self._db = kuzu.Database(str(path), read_only=read_only)
+                self._conn = kuzu.Connection(self._db)
+                if not read_only:
+                    self._create_schema()
+                return
+            except RuntimeError as e:
+                if "lock" in str(e).lower() and attempt < max_retries:
+                    logger.debug(
+                        "Lock contention on attempt %d/%d, retrying in %.1fs",
+                        attempt + 1, max_retries, retry_delay * (2 ** attempt),
+                    )
+                    self.close()
+                    time.sleep(retry_delay * (2 ** attempt))
+                    continue
+                raise
 
     def close(self) -> None:
-        """Release the connection and database handles.
-
-        Explicitly deletes the connection and database objects to ensure
-        KuzuDB releases file locks and flushes data.
-        """
+        """Release the connection and database handles, freeing KuzuDB file locks."""
         if self._conn is not None:
             try:
                 del self._conn
@@ -153,21 +177,15 @@ class KuzuBackend:
             self._db = None
 
     def add_nodes(self, nodes: list[GraphNode]) -> None:
-        """Insert nodes into their respective label tables."""
         for node in nodes:
             self._insert_node(node)
 
     def add_relationships(self, rels: list[GraphRelationship]) -> None:
-        """Insert relationships by matching source and target nodes."""
         for rel in rels:
             self._insert_relationship(rel)
 
     def remove_nodes_by_file(self, file_path: str) -> int:
-        """Delete all nodes whose ``file_path`` matches across every table.
-
-        Returns:
-            The number of nodes removed.
-        """
+        """Delete all nodes with the given file_path across every table. Returns count removed."""
         conn = self._require_conn()
         total = 0
         for table in _NODE_TABLE_NAMES:
@@ -398,8 +416,7 @@ class KuzuBackend:
                 )
             while result.has_next():
                 row = result.get_next()
-                nid = row[0] if row else ""
-                pname = row[1] if len(row) > 1 else ""
+                nid, pname = row[0], row[1]
                 if nid and pname and nid not in mapping:
                     mapping[nid] = pname
         except Exception:
@@ -498,13 +515,11 @@ class KuzuBackend:
                     signature = row[4] or ""
                     bm25_score = float(row[5]) if row[5] is not None else 0.0
 
-                    # Demote test file results — mirrors exact_name_search penalty.
                     if "/tests/" in file_path or "/test_" in file_path:
                         bm25_score *= 0.5
 
                     label_prefix = node_id.split(":", 1)[0] if node_id else ""
 
-                    # Boost top-level definitions in source files.
                     if label_prefix in ("function", "class") and "/tests/" not in file_path:
                         bm25_score *= 1.2
 
@@ -695,12 +710,41 @@ class KuzuBackend:
             logger.debug("get_indexed_files failed", exc_info=True)
         return mapping
 
+    def get_file_index(self) -> dict[str, str]:
+        """Return ``{file_path: node_id}`` for all File nodes."""
+        conn = self._require_conn()
+        index: dict[str, str] = {}
+        try:
+            with self._lock:
+                result = conn.execute("MATCH (n:File) RETURN n.file_path, n.id")
+            while result.has_next():
+                row = result.get_next()
+                index[row[0]] = row[1]
+        except Exception:
+            logger.debug("get_file_index failed", exc_info=True)
+        return index
+
+    def get_symbol_name_index(self) -> dict[str, list[str]]:
+        """Return ``{symbol_name: [node_id, ...]}`` for callable/type symbols."""
+        conn = self._require_conn()
+        index: dict[str, list[str]] = {}
+        tables = ["Function", "Method", "Class", "Interface", "TypeAlias"]
+        for table in tables:
+            try:
+                with self._lock:
+                    result = conn.execute(f"MATCH (n:{table}) RETURN n.name, n.id")
+                while result.has_next():
+                    row = result.get_next()
+                    index.setdefault(row[0], []).append(row[1])
+            except Exception:
+                logger.debug("get_symbol_name_index failed for %s", table, exc_info=True)
+        return index
+
     def load_graph(self) -> KnowledgeGraph:
         """Reconstruct a full :class:`KnowledgeGraph` from the database."""
         conn = self._require_conn()
         graph = KnowledgeGraph()
 
-        # -- Load nodes from every table --
         for table in _NODE_TABLE_NAMES:
             try:
                 with self._lock:
@@ -713,7 +757,6 @@ class KuzuBackend:
             except Exception:
                 logger.debug("load_graph: failed to read table %s", table, exc_info=True)
 
-        # -- Load relationships --
         try:
             with self._lock:
                 result = conn.execute(
@@ -873,7 +916,8 @@ class KuzuBackend:
     def _csv_copy(self, table: str, rows: list[list[Any]]) -> None:
         """Write *rows* to a temporary CSV and COPY FROM into *table*.
 
-        Always cleans up the temp file, even on failure.
+        Uses PARALLEL=FALSE to avoid concurrency issues with KuzuDB's
+        parallel CSV reader.  Always cleans up the temp file, even on failure.
         """
         conn = self._require_conn()
         csv_path: str | None = None
@@ -884,7 +928,7 @@ class KuzuBackend:
                 writer = csv.writer(f)
                 writer.writerows(rows)
                 csv_path = f.name
-            conn.execute(f'COPY {table} FROM "{csv_path}" (HEADER=false)')
+            conn.execute(f'COPY {table} FROM "{csv_path}" (HEADER=false, PARALLEL=false)')
         finally:
             if csv_path:
                 Path(csv_path).unlink(missing_ok=True)
@@ -906,12 +950,19 @@ class KuzuBackend:
                     [node.id, node.name, node.file_path, node.start_line,
                      node.end_line, node.content, node.signature, node.language,
                      node.class_name, node.is_dead, node.is_entry_point,
-                     node.is_exported, (node.properties or {}).get("cohesion")]
+                     node.is_exported, (node.properties or {}).get("cohesion"),
+                     _serialize_extra_props(node.properties)]
                     for node in nodes
                 ])
             return True
         except Exception:
             logger.debug("CSV bulk_load_nodes failed, falling back", exc_info=True)
+            conn = self._require_conn()
+            for table in by_table:
+                try:
+                    conn.execute(f"MATCH (n:{table}) DETACH DELETE n")
+                except Exception:
+                    pass
             return False
 
     def _bulk_load_rels_csv(self, graph: KnowledgeGraph) -> bool:
@@ -984,12 +1035,15 @@ class KuzuBackend:
         for table in _NODE_TABLE_NAMES:
             stmt = f"CREATE NODE TABLE IF NOT EXISTS {table}({_NODE_PROPERTIES})"
             conn.execute(stmt)
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD properties_json STRING DEFAULT ''")
+            except Exception:
+                pass
 
         conn.execute(
             f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
         )
 
-        # Build the REL TABLE GROUP covering all table-to-table combinations.
         from_to_pairs: list[str] = []
         for src in _NODE_TABLE_NAMES:
             for dst in _NODE_TABLE_NAMES:
@@ -1021,7 +1075,6 @@ class KuzuBackend:
                 pass
 
     def _insert_node(self, node: GraphNode) -> None:
-        """INSERT a single node into the appropriate label table using parameterized query."""
         conn = self._require_conn()
         table = _LABEL_TO_TABLE.get(node.label.value)
         if table is None:
@@ -1035,7 +1088,8 @@ class KuzuBackend:
             f"content: $content, signature: $signature, "
             f"language: $language, class_name: $class_name, "
             f"is_dead: $is_dead, is_entry_point: $is_entry_point, "
-            f"is_exported: $is_exported, cohesion: $cohesion"
+            f"is_exported: $is_exported, cohesion: $cohesion, "
+            f"properties_json: $properties_json"
             f"}})"
         )
         props = node.properties or {}
@@ -1053,6 +1107,7 @@ class KuzuBackend:
             "is_entry_point": node.is_entry_point,
             "is_exported": node.is_exported,
             "cohesion": props.get("cohesion"),
+            "properties_json": _serialize_extra_props(props),
         }
         try:
             conn.execute(query, parameters=params)
@@ -1060,7 +1115,6 @@ class KuzuBackend:
             logger.debug("Insert node failed for %s", node.id, exc_info=True)
 
     def _insert_relationship(self, rel: GraphRelationship) -> None:
-        """MATCH source and target, then CREATE the relationship using parameterized query."""
         conn = self._require_conn()
         src_table = _table_for_id(rel.source)
         tgt_table = _table_for_id(rel.target)
@@ -1149,7 +1203,8 @@ class KuzuBackend:
         Column order matches the property definition:
         0=id, 1=name, 2=file_path, 3=start_line, 4=end_line,
         5=content, 6=signature, 7=language, 8=class_name,
-        9=is_dead, 10=is_entry_point, 11=is_exported, 12=cohesion
+        9=is_dead, 10=is_entry_point, 11=is_exported, 12=cohesion,
+        13=properties_json
         """
         try:
             nid = node_id or row[0]
@@ -1162,6 +1217,14 @@ class KuzuBackend:
             props: dict[str, Any] = {}
             if len(row) > 12 and row[12] is not None:
                 props["cohesion"] = float(row[12])
+
+            if len(row) > 13 and row[13]:
+                try:
+                    extra = json.loads(row[13])
+                    if isinstance(extra, dict):
+                        props.update(extra)
+                except (ValueError, TypeError):
+                    pass
 
             return GraphNode(
                 id=row[0],

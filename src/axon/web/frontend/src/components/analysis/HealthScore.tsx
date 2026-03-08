@@ -28,7 +28,6 @@ function ProgressRing({ score, size = 120 }: { score: number; size?: number }) {
 
   return (
     <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
-      {/* Background ring */}
       <circle
         cx={size / 2}
         cy={size / 2}
@@ -37,7 +36,6 @@ function ProgressRing({ score, size = 120 }: { score: number; size?: number }) {
         stroke="var(--border)"
         strokeWidth={strokeWidth}
       />
-      {/* Progress ring */}
       <circle
         cx={size / 2}
         cy={size / 2}
@@ -119,7 +117,6 @@ export function HealthScore({ data }: HealthScoreProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: 8 }}>
-      {/* Score ring + number */}
       <div
         style={{
           display: 'flex',
@@ -144,7 +141,6 @@ export function HealthScore({ data }: HealthScoreProps) {
         </span>
       </div>
 
-      {/* Metric bars */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         {METRIC_LABELS.map(({ key, label }) => (
           <MetricBar key={key} label={label} value={data.breakdown[key]} />

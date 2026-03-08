@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown, Folder } from 'lucide-react';
 import { fileApi } from '@/api/client';
+import { errorMessage } from '@/lib/utils';
 import { useGraphStore } from '@/stores/graphStore';
 import type { FolderNode } from '@/types';
 import { LoadingSpinner } from '@/components/shared/LoadingSpinner';
@@ -41,7 +42,7 @@ export function FileTree() {
         }
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) setError(errorMessage(err, 'Failed to load file tree'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -122,7 +123,6 @@ export function FileTree() {
   );
 }
 
-/** Recursively filter tree, keeping ancestors of matching leaf nodes. */
 function filterNodes(nodes: FolderNode[], term: string): FolderNode[] {
   const result: FolderNode[] = [];
   for (const node of nodes) {
@@ -143,6 +143,14 @@ function filterNodes(nodes: FolderNode[], term: string): FolderNode[] {
   return result;
 }
 
+function setsMatch(a: Set<string>, b: Set<string>): boolean {
+  if (a.size === 0 || a.size !== b.size) return false;
+  for (const value of a) {
+    if (!b.has(value)) return false;
+  }
+  return true;
+}
+
 function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
   const [expanded, setExpanded] = useState(depth < 1);
   const selectNode = useGraphStore((s) => s.selectNode);
@@ -151,42 +159,39 @@ function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
   const nodes = useGraphStore((s) => s.nodes);
 
   const isFolder = node.type === 'folder';
+  const targetNodeIds = useMemo(() => {
+    if (isFolder) {
+      const prefix = node.path.endsWith('/') ? node.path : `${node.path}/`;
+      return new Set(
+        nodes.filter((n) => n.filePath?.startsWith(prefix)).map((n) => n.id),
+      );
+    }
+
+    return new Set(
+      nodes.filter((n) => n.filePath === node.path).map((n) => n.id),
+    );
+  }, [isFolder, node.path, nodes]);
+
+  const isActive = useMemo(
+    () => setsMatch(targetNodeIds, highlightedNodeIds),
+    [targetNodeIds, highlightedNodeIds],
+  );
 
   const handleClick = useCallback(() => {
     if (isFolder) {
       setExpanded((prev) => !prev);
-      const prefix = node.path.endsWith('/') ? node.path : node.path + '/';
-      const ids = new Set(
-        nodes.filter((n) => n.filePath?.startsWith(prefix)).map((n) => n.id),
-      );
-      if (ids.size > 0 && highlightedNodeIds.size === ids.size) {
-        const allMatch = [...ids].every((id) => highlightedNodeIds.has(id));
-        if (allMatch) {
-          setHighlightedNodes(new Set());
-          return;
-        }
-      }
-      if (ids.size > 0) {
-        selectNode(null);
-        setHighlightedNodes(ids);
-      }
-    } else {
-      const ids = new Set(
-        nodes.filter((n) => n.filePath === node.path).map((n) => n.id),
-      );
-      if (ids.size > 0 && highlightedNodeIds.size === ids.size) {
-        const allMatch = [...ids].every((id) => highlightedNodeIds.has(id));
-        if (allMatch) {
-          setHighlightedNodes(new Set());
-          return;
-        }
-      }
-      if (ids.size > 0) {
-        selectNode(null);
-        setHighlightedNodes(ids);
-      }
     }
-  }, [isFolder, selectNode, setHighlightedNodes, highlightedNodeIds, nodes, node.path]);
+
+    if (isActive) {
+      setHighlightedNodes(new Set());
+      return;
+    }
+
+    if (targetNodeIds.size > 0) {
+      selectNode(null);
+      setHighlightedNodes(targetNodeIds);
+    }
+  }, [isFolder, isActive, selectNode, setHighlightedNodes, targetNodeIds]);
 
   const fileSymbols = useMemo(() => {
     if (isFolder) return [];
@@ -207,24 +212,44 @@ function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
           paddingLeft: 8 + depth * 12,
           cursor: 'pointer',
           fontSize: 11,
-          color: 'var(--text-primary)',
+          color: isActive ? 'var(--text-bright)' : 'var(--text-primary)',
           borderRadius: 'var(--radius)',
+          background: isActive
+            ? 'color-mix(in srgb, var(--accent) 22%, var(--bg-surface))'
+            : 'transparent',
+          boxShadow: isActive
+            ? 'inset 0 0 0 1px color-mix(in srgb, var(--accent) 75%, transparent), inset 2px 0 0 0 var(--accent)'
+            : 'none',
+          transition: 'background 120ms ease, box-shadow 120ms ease, color 120ms ease',
         }}
         onMouseEnter={(e) => {
-          e.currentTarget.style.background = 'var(--bg-hover)';
+          if (!isActive) {
+            e.currentTarget.style.background = 'var(--bg-hover)';
+          }
         }}
         onMouseLeave={(e) => {
-          e.currentTarget.style.background = 'transparent';
+          e.currentTarget.style.background = isActive
+            ? 'color-mix(in srgb, var(--accent) 22%, var(--bg-surface))'
+            : 'transparent';
         }}
       >
         {isFolder ? (
           <>
             {expanded ? (
-              <ChevronDown size={12} style={{ color: 'var(--text-secondary)', flexShrink: 0 }} />
+              <ChevronDown
+                size={12}
+                style={{ color: isActive ? 'var(--accent)' : 'var(--text-secondary)', flexShrink: 0 }}
+              />
             ) : (
-              <ChevronRight size={12} style={{ color: 'var(--text-secondary)', flexShrink: 0 }} />
+              <ChevronRight
+                size={12}
+                style={{ color: isActive ? 'var(--accent)' : 'var(--text-secondary)', flexShrink: 0 }}
+              />
             )}
-            <Folder size={12} style={{ color: 'var(--node-folder)', flexShrink: 0 }} />
+            <Folder
+              size={12}
+              style={{ color: isActive ? 'var(--accent)' : 'var(--node-folder)', flexShrink: 0 }}
+            />
           </>
         ) : (
           <>
@@ -237,9 +262,9 @@ function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
                 style={{ flexShrink: 0, display: 'flex', alignItems: 'center' }}
               >
                 {symbolsExpanded ? (
-                  <ChevronDown size={12} style={{ color: 'var(--text-secondary)' }} />
+                  <ChevronDown size={12} style={{ color: isActive ? 'var(--accent)' : 'var(--text-secondary)' }} />
                 ) : (
-                  <ChevronRight size={12} style={{ color: 'var(--text-secondary)' }} />
+                  <ChevronRight size={12} style={{ color: isActive ? 'var(--accent)' : 'var(--text-secondary)' }} />
                 )}
               </span>
             ) : (
@@ -250,7 +275,8 @@ function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
                 width: 6,
                 height: 6,
                 borderRadius: '50%',
-                background: langColor(node.language),
+                background: isActive ? 'var(--accent)' : langColor(node.language),
+                boxShadow: isActive ? '0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent)' : 'none',
                 flexShrink: 0,
               }}
             />
@@ -262,17 +288,22 @@ function TreeNode({ node, depth }: { node: FolderNode; depth: number }) {
           style={{
             flex: 1,
             minWidth: 0,
-            color: isFolder ? 'var(--text-bright)' : 'var(--text-primary)',
+            color: isActive
+              ? 'var(--text-bright)'
+              : isFolder
+                ? 'var(--text-bright)'
+                : 'var(--text-primary)',
+            fontWeight: isActive ? 600 : 400,
           }}
         >
           {node.name}
         </span>
 
         {isFolder && node.children && node.children.length > 0 && (
-          <Badge>{node.children.length}</Badge>
+          <Badge active={isActive}>{node.children.length}</Badge>
         )}
         {!isFolder && node.symbolCount != null && node.symbolCount > 0 && (
-          <Badge>{node.symbolCount}</Badge>
+          <Badge active={isActive}>{node.symbolCount}</Badge>
         )}
       </div>
 
@@ -347,17 +378,20 @@ function SymbolRow({
   );
 }
 
-function Badge({ children }: { children: React.ReactNode }) {
+function Badge({ children, active = false }: { children: React.ReactNode; active?: boolean }) {
   return (
     <span
       style={{
-        background: 'var(--bg-elevated)',
-        color: 'var(--text-secondary)',
+        background: active
+          ? 'color-mix(in srgb, var(--accent) 18%, var(--bg-elevated))'
+          : 'var(--bg-elevated)',
+        color: active ? 'var(--accent)' : 'var(--text-secondary)',
         fontSize: 11,
         padding: '0 4px',
         borderRadius: 'var(--radius)',
         fontFamily: "'JetBrains Mono', monospace",
         flexShrink: 0,
+        fontWeight: active ? 600 : 400,
       }}
     >
       {children}

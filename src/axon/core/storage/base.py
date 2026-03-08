@@ -14,6 +14,7 @@ from typing import Any, Protocol, runtime_checkable
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, GraphRelationship, RelType
 
+
 @dataclass
 class SearchResult:
     """A single result from a full-text or vector search."""
@@ -175,6 +176,14 @@ class StorageBackend(Protocol):
 
     def remove_relationships_by_type(self, rel_type: RelType) -> None:
         """Delete all relationships of a specific type."""
+        ...
+
+    def get_file_index(self) -> dict[str, str]:
+        """Return ``{file_path: node_id}`` for all File nodes."""
+        ...
+
+    def get_symbol_name_index(self) -> dict[str, list[str]]:
+        """Return ``{symbol_name: [node_id, ...]}`` for callable/type symbols."""
         ...
 
     def rebuild_fts_indexes(self) -> None:

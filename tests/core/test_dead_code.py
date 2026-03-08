@@ -12,6 +12,7 @@ from axon.core.graph.model import (
 )
 from axon.core.ingestion.dead_code import process_dead_code
 
+
 def _add_file_node(graph: KnowledgeGraph, path: str) -> str:
     """Add a File node and return its ID."""
     node_id = generate_id(NodeLabel.FILE, path)

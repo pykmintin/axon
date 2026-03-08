@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
 import { cypherApi } from '@/api/client';
 import { useDataStore } from '@/stores/dataStore';
+import { errorMessage } from '@/lib/utils';
 import { QueryEditor } from './QueryEditor';
 import { ResultsTable } from './ResultsTable';
 
@@ -25,9 +26,7 @@ export function CypherView() {
       setCypherResult(result);
       addCypherHistory(trimmed);
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'Query execution failed';
-      setError(message);
+      setError(errorMessage(err, 'Query execution failed'));
       setCypherResult(null);
     } finally {
       setLoading(false);

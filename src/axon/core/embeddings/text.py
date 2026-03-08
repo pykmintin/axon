@@ -11,6 +11,7 @@ from __future__ import annotations
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, NodeLabel, RelType
 
+
 def build_class_method_index(graph: KnowledgeGraph) -> dict[tuple[str, str], list[str]]:
     """Pre-build a mapping from (class_name, file_path) to sorted method names.
 

@@ -14,7 +14,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import GraphNode, GraphRelationship
+from axon.core.ingestion.pipeline import build_graph
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +124,6 @@ def diff_branches(
         ValueError: If the branch range format is invalid.
         RuntimeError: If git operations fail.
     """
-    from axon.core.ingestion.pipeline import build_graph
-
     if ".." in branch_range:
         parts = branch_range.split("..", 1)
         base_ref = parts[0].strip()
@@ -171,7 +171,7 @@ def diff_branches(
 
     return diff_graphs(base_nodes, current_nodes, base_rels, current_rels)
 
-def _build_graph_for_ref(repo_path: Path, ref: str) -> "tuple[KnowledgeGraph, Path]":
+def _build_graph_for_ref(repo_path: Path, ref: str) -> tuple[KnowledgeGraph, str]:
     """Build an in-memory graph for a git ref using a temporary worktree.
 
     Returns:
@@ -179,9 +179,6 @@ def _build_graph_for_ref(repo_path: Path, ref: str) -> "tuple[KnowledgeGraph, Pa
         *worktree_path* to normalize absolute paths embedded in node IDs
         back to repo-relative paths before comparing graphs.
     """
-    from axon.core.graph.graph import KnowledgeGraph
-    from axon.core.ingestion.pipeline import build_graph
-
     with tempfile.TemporaryDirectory(prefix="axon_diff_") as tmp_dir:
         worktree_path = Path(tmp_dir) / "worktree"
 

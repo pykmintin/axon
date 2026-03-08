@@ -20,11 +20,12 @@ from pathlib import Path
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import (
+    GraphNode,
     GraphRelationship,
     NodeLabel,
     RelType,
-    generate_id,
 )
+from axon.core.ingestion.resolved import ResolvedEdge
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def parse_git_log(
         "git",
         "log",
         "--name-only",
-        f'--pretty=format:COMMIT:%H',
+        '--pretty=format:COMMIT:%H',
         f"--since={since_months} months ago",
     ]
 
@@ -82,7 +83,6 @@ def parse_git_log(
             continue
 
         if stripped.startswith("COMMIT:"):
-            # Start of a new commit — flush the previous one.
             if current_files:
                 commits.append(current_files)
             current_files = []
@@ -90,7 +90,6 @@ def parse_git_log(
             if graph_files is None or stripped in graph_files:
                 current_files.append(stripped)
 
-    # Flush the last commit.
     if current_files:
         commits.append(current_files)
 
@@ -100,8 +99,8 @@ def build_cochange_matrix(
     commits: list[list[str]],
     min_cochanges: int = 3,
     max_files_per_commit: int = 50,
-) -> dict[tuple[str, str], int]:
-    """Build a co-change frequency matrix from commit data.
+) -> tuple[dict[tuple[str, str], int], dict[str, int]]:
+    """Build a co-change frequency matrix and per-file change counts.
 
     For every pair of files that appear in the same commit, their co-change
     count is incremented.  Only pairs whose count meets or exceeds
@@ -120,18 +119,24 @@ def build_cochange_matrix(
         max_files_per_commit: Skip commits with more files than this.
 
     Returns:
-        A dict mapping ``(file_a, file_b)`` sorted tuples to their count.
+        A tuple of (cochange_matrix, total_changes) where cochange_matrix
+        maps ``(file_a, file_b)`` sorted tuples to their count, and
+        total_changes maps each file to its total commit count.
     """
     counts: dict[tuple[str, str], int] = defaultdict(int)
+    total_changes: dict[str, int] = defaultdict(int)
 
     for files in commits:
         unique_files = sorted(set(files))
+        for f in unique_files:
+            total_changes[f] += 1
         if len(unique_files) > max_files_per_commit:
             continue
         for a, b in combinations(unique_files, 2):
             counts[(a, b)] += 1
 
-    return {pair: count for pair, count in counts.items() if count >= min_cochanges}
+    filtered = {pair: count for pair, count in counts.items() if count >= min_cochanges}
+    return filtered, dict(total_changes)
 
 def calculate_coupling(
     file_a: str,
@@ -139,27 +144,53 @@ def calculate_coupling(
     co_changes: int,
     total_changes: dict[str, int],
 ) -> float:
-    """Compute the coupling strength between two files.
-
-    The formula is::
-
-        coupling = co_changes / max(total_changes[file_a], total_changes[file_b])
-
-    This yields a value in ``[0.0, 1.0]`` — higher means more tightly coupled.
-
-    Args:
-        file_a: First file path.
-        file_b: Second file path.
-        co_changes: Number of commits where both files changed together.
-        total_changes: Mapping of file path to its total commit count.
-
-    Returns:
-        A float between 0.0 and 1.0 representing coupling strength.
-    """
     max_changes = max(total_changes.get(file_a, 0), total_changes.get(file_b, 0))
     if max_changes == 0:
         return 0.0
     return co_changes / max_changes
+
+def resolve_coupling(
+    graph: KnowledgeGraph,
+    repo_path: Path,
+    min_strength: float = 0.3,
+    *,
+    commits: list[list[str]] | None = None,
+    min_cochanges: int = 3,
+    file_nodes: list[GraphNode] | None = None,
+) -> list[ResolvedEdge]:
+    if file_nodes is None:
+        file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
+    graph_files: set[str] = {n.file_path for n in file_nodes}
+
+    if commits is None:
+        commits = parse_git_log(repo_path, graph_files=graph_files)
+
+    cochange, total_changes = build_cochange_matrix(commits, min_cochanges=min_cochanges)
+
+    path_to_id: dict[str, str] = {n.file_path: n.id for n in file_nodes}
+
+    edges: list[ResolvedEdge] = []
+    for (file_a, file_b), co_changes in cochange.items():
+        strength = calculate_coupling(file_a, file_b, co_changes, total_changes)
+        if strength < min_strength:
+            continue
+
+        id_a = path_to_id.get(file_a)
+        id_b = path_to_id.get(file_b)
+        if id_a is None or id_b is None:
+            continue
+
+        rel_id = f"coupled:{id_a}->{id_b}"
+        edges.append(ResolvedEdge(
+            rel_id=rel_id,
+            rel_type=RelType.COUPLED_WITH,
+            source=id_a,
+            target=id_b,
+            properties={"strength": strength, "co_changes": co_changes},
+        ))
+
+    return edges
+
 
 def process_coupling(
     graph: KnowledgeGraph,
@@ -188,44 +219,21 @@ def process_coupling(
     Returns:
         The number of ``COUPLED_WITH`` relationships created.
     """
-    file_nodes = graph.get_nodes_by_label(NodeLabel.FILE)
-    graph_files: set[str] = {n.file_path for n in file_nodes}
+    edges = resolve_coupling(
+        graph, repo_path, min_strength,
+        commits=commits, min_cochanges=min_cochanges,
+    )
 
-    if commits is None:
-        commits = parse_git_log(repo_path, graph_files=graph_files)
-
-    cochange = build_cochange_matrix(commits, min_cochanges=min_cochanges)
-
-    # Count total changes per file (across all commits).
-    total_changes: dict[str, int] = defaultdict(int)
-    for files in commits:
-        for f in set(files):
-            total_changes[f] += 1
-
-    path_to_id: dict[str, str] = {n.file_path: n.id for n in file_nodes}
-
-    count = 0
-    for (file_a, file_b), co_changes in cochange.items():
-        strength = calculate_coupling(file_a, file_b, co_changes, total_changes)
-        if strength < min_strength:
-            continue
-
-        id_a = path_to_id.get(file_a)
-        id_b = path_to_id.get(file_b)
-        if id_a is None or id_b is None:
-            continue
-
-        rel_id = f"coupled:{id_a}->{id_b}"
+    for edge in edges:
         graph.add_relationship(
             GraphRelationship(
-                id=rel_id,
-                type=RelType.COUPLED_WITH,
-                source=id_a,
-                target=id_b,
-                properties={"strength": strength, "co_changes": co_changes},
+                id=edge.rel_id,
+                type=edge.rel_type,
+                source=edge.source,
+                target=edge.target,
+                properties=edge.properties,
             )
         )
-        count += 1
 
-    logger.info("Created %d COUPLED_WITH relationships", count)
-    return count
+    logger.info("Created %d COUPLED_WITH relationships", len(edges))
+    return len(edges)

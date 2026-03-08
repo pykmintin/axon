@@ -15,6 +15,7 @@ from axon.core.graph.model import (
 from axon.core.storage.base import NodeEmbedding
 from axon.core.storage.kuzu_backend import KuzuBackend
 
+
 @pytest.fixture()
 def backend(tmp_path: Path) -> KuzuBackend:
     """Return a KuzuBackend initialised in a temporary directory."""

@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 from axon.core.parsers.typescript import TypeScriptParser
+
+
 @pytest.fixture
 def ts_parser() -> TypeScriptParser:
     return TypeScriptParser(dialect="typescript")

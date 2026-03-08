@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "feature-image": {
+      "source": "Shpigford/skills",
+      "sourceType": "github",
+      "computedHash": "33c7a493eca29c3a2f4bb165069501d6438c945f87413b667cdd760fd95d93fb"
+    }
+  }
+}

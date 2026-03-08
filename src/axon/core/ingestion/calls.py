@@ -13,6 +13,8 @@ Resolution priority:
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 from axon.core.graph.graph import KnowledgeGraph
 from axon.core.graph.model import (
@@ -22,7 +24,13 @@ from axon.core.graph.model import (
     generate_id,
 )
 from axon.core.ingestion.parser_phase import FileParseData
-from axon.core.ingestion.symbol_lookup import build_file_symbol_index, build_name_index, find_containing_symbol
+from axon.core.ingestion.resolved import ResolvedEdge
+from axon.core.ingestion.symbol_lookup import (
+    FileSymbolIndex,
+    build_file_symbol_index,
+    build_name_index,
+    find_containing_symbol,
+)
 from axon.core.parsers.base import CallInfo
 
 logger = logging.getLogger(__name__)
@@ -81,6 +89,8 @@ def resolve_call(
     file_path: str,
     call_index: dict[str, list[str]],
     graph: KnowledgeGraph,
+    caller_class_name: str | None = None,
+    import_cache: dict[str, set[str]] | None = None,
 ) -> tuple[str | None, float]:
     """Resolve a call expression to a target node ID and confidence score.
 
@@ -91,8 +101,8 @@ def resolve_call(
     2. **Import-resolved match** (confidence 1.0) -- the called name was
        imported into this file; find the symbol in the imported file.
     3. **Global fuzzy match** (confidence 0.5) -- any symbol with this name
-       anywhere in the codebase.  If multiple matches exist, the one with
-       the shortest file path is chosen (heuristic for proximity).
+       anywhere in the codebase.  If multiple matches exist, the one sharing
+       the longest directory prefix with the caller is preferred.
 
     For method calls (``call.receiver`` is non-empty):
     - If the receiver is ``"self"`` or ``"this"``, look for a method with
@@ -105,6 +115,8 @@ def resolve_call(
         call_index: Mapping from symbol names to node IDs built by
             :func:`build_call_index`.
         graph: The knowledge graph.
+        caller_class_name: Optional class name of the calling symbol,
+            used to scope ``self``/``this`` method resolution.
 
     Returns:
         A tuple of ``(node_id, confidence)`` or ``(None, 0.0)`` if the
@@ -114,40 +126,42 @@ def resolve_call(
     receiver = call.receiver
 
     if receiver in ("self", "this"):
-        result = _resolve_self_method(name, file_path, call_index, graph)
+        result = _resolve_self_method(name, file_path, call_index, graph, caller_class_name)
         if result is not None:
             return result, 1.0
 
-    # Without type info the receiver doesn't help — fall through to name-based resolution.
     candidate_ids = call_index.get(name, [])
     if not candidate_ids:
         return None, 0.0
 
-    # 1. Same-file exact match.
     for nid in candidate_ids:
         node = graph.get_node(nid)
         if node is not None and node.file_path == file_path:
             return nid, 1.0
 
-    # 2. Import-resolved match.
-    imported_target = _resolve_via_imports(name, file_path, candidate_ids, graph)
+    effective_cache = import_cache if import_cache is not None else _build_import_cache(file_path, graph)
+    imported_target = _resolve_via_imports(name, candidate_ids, graph, effective_cache)
     if imported_target is not None:
         return imported_target, 1.0
 
-    # 3. Global fuzzy match -- prefer shortest file path.
-    return _pick_closest(candidate_ids, graph), 0.5
+    if len(candidate_ids) > 5:
+        return None, 0.0
+    return _pick_closest(candidate_ids, graph, caller_file_path=file_path), 0.5
 
 def _resolve_self_method(
     method_name: str,
     file_path: str,
     call_index: dict[str, list[str]],
     graph: KnowledgeGraph,
+    caller_class_name: str | None = None,
 ) -> str | None:
-    """Find a method with *method_name* in the same file (same class).
+    """Find a method with *method_name* in the same file and class.
 
     When the receiver is ``self`` or ``this`` the target must be a Method
-    node defined in the same file.
+    node defined in the same file.  If *caller_class_name* is provided,
+    candidates are further filtered to the same class.
     """
+    fallback: str | None = None
     for nid in call_index.get(method_name, []):
         node = graph.get_node(nid)
         if (
@@ -155,85 +169,124 @@ def _resolve_self_method(
             and node.label == NodeLabel.METHOD
             and node.file_path == file_path
         ):
-            return nid
-    return None
+            if caller_class_name and node.class_name == caller_class_name:
+                return nid
+            if fallback is None:
+                fallback = nid
+    return fallback
 
-def _resolve_via_imports(
-    name: str,
+def _build_import_cache(
     file_path: str,
-    candidate_ids: list[str],
     graph: KnowledgeGraph,
-) -> str | None:
-    """Check if *name* was imported into *file_path* and resolve to the target.
+) -> dict[str, set[str]]:
+    """Build {symbol_name → set of imported file_paths} for a file.
 
-    Looks at IMPORTS relationships originating from this file's File node.
-    For each imported file, checks whether any candidate symbol is defined
-    there.  Also checks the ``symbols`` property to see if the specific
-    name was explicitly imported.
+    The special key ``"*"`` contains file paths from wildcard/full-module imports.
     """
     source_file_id = generate_id(NodeLabel.FILE, file_path)
     import_rels = graph.get_outgoing(source_file_id, RelType.IMPORTS)
 
-    if not import_rels:
-        return None
-
-    # Collect file paths of imported files, optionally filtering by
-    # the imported symbol names.
-    imported_file_ids: set[str] = set()
+    cache: dict[str, set[str]] = {}
     for rel in import_rels:
+        target_node = graph.get_node(rel.target)
+        if target_node is None:
+            continue
         symbols_str = rel.properties.get("symbols", "")
         imported_names = {s.strip() for s in symbols_str.split(",") if s.strip()}
+        if not imported_names:
+            cache.setdefault("*", set()).add(target_node.file_path)
+        else:
+            for sym_name in imported_names:
+                cache.setdefault(sym_name, set()).add(target_node.file_path)
+    return cache
 
-        # If the specific name was imported, or if it's a wildcard/full
-        # module import (no specific names), include this target file.
-        if not imported_names or name in imported_names:
-            target_node = graph.get_node(rel.target)
-            if target_node is not None:
-                imported_file_ids.add(target_node.file_path)
+
+def _resolve_via_imports(
+    name: str,
+    candidate_ids: list[str],
+    graph: KnowledgeGraph,
+    import_cache: dict[str, set[str]],
+) -> str | None:
+    """Check if *name* was imported and resolve to the target using cached data.
+
+    Uses the pre-built *import_cache* (from :func:`_build_import_cache`)
+    to avoid re-scanning IMPORTS relationships for every call in the same file.
+    """
+    if not import_cache:
+        return None
+
+    imported_file_paths = import_cache.get(name, set()) | import_cache.get("*", set())
+    if not imported_file_paths:
+        return None
 
     for nid in candidate_ids:
         node = graph.get_node(nid)
-        if node is not None and node.file_path in imported_file_ids:
+        if node is not None and node.file_path in imported_file_paths:
             return nid
 
     return None
 
-def _pick_closest(candidate_ids: list[str], graph: KnowledgeGraph) -> str | None:
-    """Pick the candidate with the shortest file path (proximity heuristic).
+def _common_prefix_len(a: str, b: str) -> int:
+    """Return the length of the common directory prefix between two paths."""
+    parts_a = a.split("/")
+    parts_b = b.split("/")
+    common = 0
+    for pa, pb in zip(parts_a, parts_b):
+        if pa == pb:
+            common += 1
+        else:
+            break
+    return common
 
+
+def _pick_closest(
+    candidate_ids: list[str],
+    graph: KnowledgeGraph,
+    caller_file_path: str = "",
+) -> str | None:
+    """Pick the candidate sharing the longest directory prefix with the caller.
+
+    Falls back to shortest file path when no caller path is provided.
     Returns ``None`` if no candidates can be resolved to actual nodes.
     """
     best_id: str | None = None
-    best_path_len = float("inf")
+    best_score: tuple[int, int] = (-1, 0)
 
     for nid in candidate_ids:
         node = graph.get_node(nid)
-        if node is not None and len(node.file_path) < best_path_len:
-            best_path_len = len(node.file_path)
+        if node is None:
+            continue
+        if caller_file_path:
+            prefix = _common_prefix_len(caller_file_path, node.file_path)
+            score = (prefix, -len(node.file_path))
+        else:
+            score = (0, -len(node.file_path))
+        if score > best_score:
+            best_score = score
             best_id = nid
 
     return best_id
 
-def _add_calls_edge(
+
+def _make_edge(
     source_id: str,
     target_id: str,
     confidence: float,
-    graph: KnowledgeGraph,
     seen: set[str],
-) -> None:
-    """Create a deduplicated CALLS relationship."""
+) -> ResolvedEdge | None:
+    """Create a deduplicated ResolvedEdge, returning None if already seen."""
     rel_id = f"calls:{source_id}->{target_id}"
-    if rel_id not in seen:
-        seen.add(rel_id)
-        graph.add_relationship(
-            GraphRelationship(
-                id=rel_id,
-                type=RelType.CALLS,
-                source=source_id,
-                target=target_id,
-                properties={"confidence": confidence},
-            )
-        )
+    if rel_id in seen:
+        return None
+    seen.add(rel_id)
+    return ResolvedEdge(
+        rel_id=rel_id,
+        rel_type=RelType.CALLS,
+        source=source_id,
+        target=target_id,
+        properties={"confidence": confidence},
+    )
+
 
 def _resolve_receiver_method(
     receiver: str,
@@ -242,9 +295,8 @@ def _resolve_receiver_method(
     file_path: str,
     call_index: dict[str, list[str]],
     graph: KnowledgeGraph,
-    seen: set[str],
-) -> None:
-    """Resolve ``Receiver.method()`` to the METHOD node and create a CALLS edge.
+) -> ResolvedEdge | None:
+    """Resolve ``Receiver.method()`` to the METHOD node and return a ResolvedEdge.
 
     Looks for a METHOD node whose ``name`` matches *method_name* and whose
     ``class_name`` matches *receiver*.  Searches same-file first, then
@@ -270,13 +322,139 @@ def _resolve_receiver_method(
 
     target = same_file_match or global_match
     if target is not None:
-        _add_calls_edge(source_id, target, 0.8, graph, seen)
+        return ResolvedEdge(
+            rel_id=f"calls:{source_id}->{target}",
+            rel_type=RelType.CALLS,
+            source=source_id,
+            target=target,
+            properties={"confidence": 0.8},
+        )
+    return None
+
+
+def resolve_file_calls(
+    fpd: FileParseData,
+    call_index: dict[str, list[str]],
+    file_sym_index: FileSymbolIndex,
+    graph: KnowledgeGraph,
+) -> list[ResolvedEdge]:
+    """Resolve all call expressions in a single file to ResolvedEdge objects.
+
+    This is a pure-ish function (reads from graph but does not mutate it)
+    that can be called in parallel across files.
+    """
+    edges: list[ResolvedEdge] = []
+    seen: set[str] = set()
+    import_cache = _build_import_cache(fpd.file_path, graph)
+
+    for call in fpd.parse_result.calls:
+        if call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this"):
+            continue
+
+        source_id = find_containing_symbol(
+            call.line, fpd.file_path, file_sym_index
+        )
+        if source_id is None:
+            logger.debug(
+                "No containing symbol for call %s at line %d in %s",
+                call.name,
+                call.line,
+                fpd.file_path,
+            )
+            continue
+
+        caller_class_name: str | None = None
+        if call.receiver in ("self", "this"):
+            source_node = graph.get_node(source_id)
+            if source_node is not None:
+                caller_class_name = source_node.class_name
+
+        target_id, confidence = resolve_call(
+            call, fpd.file_path, call_index, graph,
+            caller_class_name=caller_class_name,
+            import_cache=import_cache,
+        )
+        if target_id is not None:
+            edge = _make_edge(source_id, target_id, confidence, seen)
+            if edge is not None:
+                edges.append(edge)
+
+        for arg_name in call.arguments:
+            if arg_name in _CALL_BLOCKLIST:
+                continue
+            arg_call = CallInfo(name=arg_name, line=call.line)
+            arg_id, arg_conf = resolve_call(
+                arg_call, fpd.file_path, call_index, graph,
+                import_cache=import_cache,
+            )
+            if arg_id is not None:
+                edge = _make_edge(source_id, arg_id, arg_conf * 0.8, seen)
+                if edge is not None:
+                    edges.append(edge)
+
+        receiver = call.receiver
+        if receiver and receiver not in ("self", "this"):
+            receiver_call = CallInfo(name=receiver, line=call.line)
+            recv_id, recv_conf = resolve_call(
+                receiver_call, fpd.file_path, call_index, graph,
+                import_cache=import_cache,
+            )
+            if recv_id is not None:
+                edge = _make_edge(source_id, recv_id, recv_conf, seen)
+                if edge is not None:
+                    edges.append(edge)
+
+            recv_method_edge = _resolve_receiver_method(
+                receiver, call.name, source_id, fpd.file_path,
+                call_index, graph,
+            )
+            if recv_method_edge is not None and recv_method_edge.rel_id not in seen:
+                seen.add(recv_method_edge.rel_id)
+                edges.append(recv_method_edge)
+
+    for symbol in fpd.parse_result.symbols:
+        if not symbol.decorators:
+            continue
+
+        symbol_name = (
+            f"{symbol.class_name}.{symbol.name}"
+            if symbol.kind == "method" and symbol.class_name
+            else symbol.name
+        )
+        label = _KIND_TO_LABEL.get(symbol.kind)
+        if label is None:
+            continue
+        source_id = generate_id(label, fpd.file_path, symbol_name)
+
+        for dec_name in symbol.decorators:
+            base_name = dec_name.rsplit(".", 1)[-1] if "." in dec_name else dec_name
+            call_obj = CallInfo(name=base_name, line=symbol.start_line)
+            target_id, confidence = resolve_call(
+                call_obj, fpd.file_path, call_index, graph,
+                import_cache=import_cache,
+            )
+            if target_id is None and "." in dec_name:
+                call_obj = CallInfo(name=dec_name, line=symbol.start_line)
+                target_id, confidence = resolve_call(
+                    call_obj, fpd.file_path, call_index, graph,
+                    import_cache=import_cache,
+                )
+            if target_id is not None:
+                edge = _make_edge(source_id, target_id, confidence, seen)
+                if edge is not None:
+                    edges.append(edge)
+
+    return edges
 
 
 def process_calls(
     parse_data: list[FileParseData],
     graph: KnowledgeGraph,
-) -> None:
+    name_index: dict[str, list[str]] | None = None,
+    *,
+    parallel: bool = False,
+    collect: bool = False,
+) -> list[ResolvedEdge] | None:
     """Resolve call expressions and create CALLS relationships in the graph.
 
     For each call expression in the parse data:
@@ -287,114 +465,53 @@ def process_calls(
     3. Create a CALLS relationship from the containing symbol to the
        target, with a ``confidence`` property.
 
-    Skips calls where:
-    - The containing symbol cannot be determined.
-    - The target cannot be resolved.
-    - A relationship with the same ID already exists (deduplication).
-
     Args:
         parse_data: File parse results from the parser phase.
         graph: The knowledge graph to populate with CALLS relationships.
+        name_index: Optional pre-built name index; built automatically if None.
+        parallel: When True, resolve files using a thread pool.
+        collect: When True, return the list of ResolvedEdge objects instead
+            of writing them to the graph.
+
+    Returns:
+        A list of ResolvedEdge when *collect* is True, otherwise None.
     """
-    call_index = build_name_index(graph, _CALLABLE_LABELS)
+    call_index = name_index if name_index is not None else build_name_index(graph, _CALLABLE_LABELS)
     file_sym_index = build_file_symbol_index(graph, _CALLABLE_LABELS)
+
+    if parallel and len(parse_data) > 1:
+        workers = min(os.cpu_count() or 4, 8, len(parse_data))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(resolve_file_calls, fpd, call_index, file_sym_index, graph)
+                for fpd in parse_data
+            ]
+            per_file_edges = [f.result() for f in futures]
+    else:
+        per_file_edges = [
+            resolve_file_calls(fpd, call_index, file_sym_index, graph)
+            for fpd in parse_data
+        ]
+
     seen: set[str] = set()
+    deduped: list[ResolvedEdge] = []
+    for file_edges in per_file_edges:
+        for edge in file_edges:
+            if edge.rel_id not in seen:
+                seen.add(edge.rel_id)
+                deduped.append(edge)
 
-    for fpd in parse_data:
-        for call in fpd.parse_result.calls:
-            if call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this"):
-                continue
+    if collect:
+        return deduped
 
-            source_id = find_containing_symbol(
-                call.line, fpd.file_path, file_sym_index
+    for edge in deduped:
+        graph.add_relationship(
+            GraphRelationship(
+                id=edge.rel_id,
+                type=edge.rel_type,
+                source=edge.source,
+                target=edge.target,
+                properties=edge.properties,
             )
-            if source_id is None:
-                logger.debug(
-                    "No containing symbol for call %s at line %d in %s",
-                    call.name,
-                    call.line,
-                    fpd.file_path,
-                )
-                continue
-
-            target_id, confidence = resolve_call(
-                call, fpd.file_path, call_index, graph
-            )
-            if target_id is not None:
-                _add_calls_edge(source_id, target_id, confidence, graph, seen)
-
-            # Callback arguments: bare identifiers passed as arguments
-            # (e.g. map(transform, items), Depends(get_db)).
-            for arg_name in call.arguments:
-                if arg_name in _CALL_BLOCKLIST:
-                    continue
-                arg_call = CallInfo(name=arg_name, line=call.line)
-                arg_id, arg_conf = resolve_call(
-                    arg_call, fpd.file_path, call_index, graph
-                )
-                if arg_id is not None:
-                    _add_calls_edge(source_id, arg_id, arg_conf * 0.8, graph, seen)
-
-            # Receiver: link to the class and resolve the method on it.
-            receiver = call.receiver
-            if receiver and receiver not in ("self", "this"):
-                receiver_call = CallInfo(name=receiver, line=call.line)
-                recv_id, recv_conf = resolve_call(
-                    receiver_call, fpd.file_path, call_index, graph
-                )
-                if recv_id is not None:
-                    _add_calls_edge(source_id, recv_id, recv_conf, graph, seen)
-
-                _resolve_receiver_method(
-                    receiver, call.name, source_id, fpd.file_path,
-                    call_index, graph, seen,
-                )
-
-        # Decorators are implicit calls — @cost_decorator on a function is
-        # equivalent to calling cost_decorator(func).  Create CALLS edges
-        # from the decorated symbol to the decorator definition.
-        for symbol in fpd.parse_result.symbols:
-            if not symbol.decorators:
-                continue
-
-            symbol_name = (
-                f"{symbol.class_name}.{symbol.name}"
-                if symbol.kind == "method" and symbol.class_name
-                else symbol.name
-            )
-            label = _KIND_TO_LABEL.get(symbol.kind)
-            if label is None:
-                continue
-            source_id = generate_id(label, fpd.file_path, symbol_name)
-
-            for dec_name in symbol.decorators:
-                # Strip the base name for dotted decorators (e.g. "app.route" → "route")
-                # but also try the full dotted name.
-                base_name = dec_name.rsplit(".", 1)[-1] if "." in dec_name else dec_name
-                call_obj = CallInfo(name=base_name, line=symbol.start_line)
-                target_id, confidence = resolve_call(
-                    call_obj, fpd.file_path, call_index, graph
-                )
-                if target_id is None and "." in dec_name:
-                    # Try full dotted name as well.
-                    call_obj = CallInfo(name=dec_name, line=symbol.start_line)
-                    target_id, confidence = resolve_call(
-                        call_obj, fpd.file_path, call_index, graph
-                    )
-                if target_id is None:
-                    continue
-
-                rel_id = f"calls:{source_id}->{target_id}"
-                if rel_id in seen:
-                    continue
-                seen.add(rel_id)
-
-                graph.add_relationship(
-                    GraphRelationship(
-                        id=rel_id,
-                        type=RelType.CALLS,
-                        source=source_id,
-                        target=target_id,
-                        properties={"confidence": confidence},
-                    )
-                )
+        )
+    return None

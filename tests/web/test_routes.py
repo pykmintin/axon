@@ -33,6 +33,7 @@ def _make_app(
     from axon.web.routes.events import router as events_router
     from axon.web.routes.files import router as files_router
     from axon.web.routes.graph import router as graph_router
+    from axon.web.routes.host import router as host_router
     from axon.web.routes.processes import router as processes_router
     from axon.web.routes.search import router as search_router
 
@@ -41,8 +42,12 @@ def _make_app(
     app.state.repo_path = repo_path
     app.state.event_listeners = None
     app.state.watch = watch
+    app.state.host_url = "http://127.0.0.1:8420"
+    app.state.mcp_url = "http://127.0.0.1:8420/mcp"
+    app.state.mode = "host" if watch else "standalone"
 
     app.include_router(graph_router)
+    app.include_router(host_router)
     app.include_router(search_router)
     app.include_router(analysis_router)
     app.include_router(files_router)
@@ -215,6 +220,16 @@ class TestOverviewEndpoint:
         assert data["totalEdges"] == 130
         assert data["nodesByLabel"]["function"] == 42
         assert data["edgesByType"]["calls"] == 100
+
+
+class TestHostEndpoint:
+    def test_host_info(self, client_with_repo: TestClient, tmp_path: Path) -> None:
+        response = client_with_repo.get("/host")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["repoPath"] == str(tmp_path)
+        assert data["hostUrl"] == "http://127.0.0.1:8420"
+        assert data["mcpUrl"] == "http://127.0.0.1:8420/mcp"
 
 
 class TestNodeEndpoint:
@@ -730,7 +745,8 @@ class TestDiffEndpoint:
     def test_diff_success(
         self, mock_storage: MagicMock, tmp_path: Path
     ) -> None:
-        from dataclasses import dataclass, field as dc_field
+        from dataclasses import dataclass
+        from dataclasses import field as dc_field
 
         @dataclass
         class FakeDiffResult:
@@ -768,7 +784,8 @@ class TestDiffEndpoint:
     def test_diff_with_modified_nodes(
         self, mock_storage: MagicMock, tmp_path: Path
     ) -> None:
-        from dataclasses import dataclass, field as dc_field
+        from dataclasses import dataclass
+        from dataclasses import field as dc_field
 
         base_node = _sample_node(
             node_id="function:src/utils.py:helper",

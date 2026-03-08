@@ -15,6 +15,8 @@ from axon.core.ingestion.community import (
     generate_label,
     process_communities,
 )
+
+
 def _add_function(
     graph: KnowledgeGraph,
     file_path: str,

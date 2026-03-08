@@ -12,6 +12,7 @@ from axon.core.ingestion.coupling import (
     process_coupling,
 )
 
+
 @pytest.fixture()
 def graph() -> KnowledgeGraph:
     """Return a KnowledgeGraph pre-populated with File nodes.
@@ -44,7 +45,7 @@ class TestBuildCochangeMatrix:
             ["src/auth.py", "src/models.py"],
             ["src/views.py", "src/utils.py"],
         ]
-        matrix = build_cochange_matrix(commits, min_cochanges=1)
+        matrix, total = build_cochange_matrix(commits, min_cochanges=1)
 
         pair = ("src/auth.py", "src/models.py")
         assert pair in matrix
@@ -54,6 +55,10 @@ class TestBuildCochangeMatrix:
         assert pair_vu in matrix
         assert matrix[pair_vu] == 1
 
+        assert total["src/auth.py"] == 3
+        assert total["src/models.py"] == 3
+        assert total["src/views.py"] == 1
+
     def test_build_cochange_matrix_min_threshold(self) -> None:
         commits = [
             ["src/auth.py", "src/models.py"],
@@ -61,7 +66,7 @@ class TestBuildCochangeMatrix:
             ["src/auth.py", "src/models.py"],
             ["src/views.py", "src/utils.py"],
         ]
-        matrix = build_cochange_matrix(commits, min_cochanges=3)
+        matrix, _ = build_cochange_matrix(commits, min_cochanges=3)
 
         # auth+models has 3 co-changes, should be included.
         assert ("src/auth.py", "src/models.py") in matrix
@@ -70,8 +75,9 @@ class TestBuildCochangeMatrix:
         assert ("src/utils.py", "src/views.py") not in matrix
 
     def test_build_cochange_matrix_empty(self) -> None:
-        matrix = build_cochange_matrix([], min_cochanges=1)
+        matrix, total = build_cochange_matrix([], min_cochanges=1)
         assert matrix == {}
+        assert total == {}
 
 class TestCalculateCoupling:
     def test_calculate_coupling(self) -> None:

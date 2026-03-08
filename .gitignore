@@ -20,3 +20,6 @@ wheels/
 # OS
 .DS_Store
 docs/
+node_modules/
+.claude/
+.agents/

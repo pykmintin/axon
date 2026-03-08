@@ -2,27 +2,53 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import anyio
 import typer
+import uvicorn
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.server.stdio import stdio_server
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from axon import __version__
+from axon.core.diff import diff_branches, format_diff
+from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
+from axon.core.ingestion.watcher import watch_repo
+from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.mcp import tools as mcp_tools
+from axon.mcp.server import main as mcp_main
+from axon.mcp.server import set_lock, set_storage
+from axon.runtime import AxonRuntime
+from axon.web import app as web_app_module
 
 console = Console()
 logger = logging.getLogger(__name__)
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8420
+DEFAULT_MANAGED_PORT = 8421
+UPDATE_CHECK_INTERVAL_SECONDS = 60 * 60 * 24
+UPDATE_CHECK_URL = "https://pypi.org/pypi/axoniq/json"
+UPDATE_CHECK_SKIP_COMMANDS = {"mcp", "serve", "host"}
 
 def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
-    """Load the KuzuDB backend for the given or current repo."""
-    from axon.core.storage.kuzu_backend import KuzuBackend
-
     target = (repo_path or Path.cwd()).resolve()
     db_path = target / ".axon" / "kuzu"
     if not db_path.exists():
@@ -34,6 +60,73 @@ def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
     storage = KuzuBackend()
     storage.initialize(db_path, read_only=True)
     return storage
+
+
+def _update_cache_path() -> Path:
+    return Path.home() / ".axon" / "update-check.json"
+
+
+def _parse_version_parts(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for raw_part in version.split("."):
+        digits = "".join(ch for ch in raw_part if ch.isdigit())
+        parts.append(int(digits or 0))
+    return tuple(parts)
+
+
+def _is_newer_version(candidate: str, current: str) -> bool:
+    return _parse_version_parts(candidate) > _parse_version_parts(current)
+
+
+def _read_update_cache() -> dict | None:
+    cache_path = _update_cache_path()
+    if not cache_path.exists():
+        return None
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_update_cache(payload: dict) -> None:
+    cache_path = _update_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _fetch_latest_version() -> str | None:
+    try:
+        with urllib.request.urlopen(UPDATE_CHECK_URL, timeout=1.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return str(payload["info"]["version"])
+    except (KeyError, OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def _get_latest_version() -> str | None:
+    now = int(time.time())
+    cache = _read_update_cache()
+    if cache is not None:
+        checked_at = int(cache.get("checked_at", 0))
+        latest = cache.get("latest_version")
+        if latest and now - checked_at < UPDATE_CHECK_INTERVAL_SECONDS:
+            return str(latest)
+
+    latest = _fetch_latest_version()
+    if latest is not None:
+        _write_update_cache({"checked_at": now, "latest_version": latest})
+    return latest
+
+
+def _maybe_notify_update(invoked_subcommand: str | None) -> None:
+    if invoked_subcommand in UPDATE_CHECK_SKIP_COMMANDS:
+        return
+    latest = _get_latest_version()
+    if latest and _is_newer_version(latest, __version__):
+        console.print(
+            f"[yellow]Update available:[/yellow] Axon {latest} "
+            f"(current {__version__}). Run `pip install -U axoniq`."
+        )
 
 
 def _register_in_global_registry(meta: dict, repo_path: Path) -> None:
@@ -81,7 +174,6 @@ def _register_in_global_registry(meta: dict, repo_path: Path) -> None:
 
 
 def _build_meta(result: "PipelineResult", repo_path: Path) -> dict:  # noqa: F821
-    """Build the meta.json dict from a pipeline result."""
     return {
         "version": __version__,
         "name": repo_path.name,
@@ -100,6 +192,189 @@ def _build_meta(result: "PipelineResult", repo_path: Path) -> dict:  # noqa: F82
     }
 
 
+def _host_meta_path(repo_path: Path) -> Path:
+    return repo_path / ".axon" / "host.json"
+
+
+def _host_lease_dir(repo_path: Path) -> Path:
+    return repo_path / ".axon" / "host-leases"
+
+
+def _display_host(host: str) -> str:
+    return "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+
+
+def _build_host_urls(host: str, port: int) -> tuple[str, str]:
+    base = f"http://{_display_host(host)}:{port}"
+    return base, f"{base}/mcp"
+
+
+def _read_host_meta(repo_path: Path) -> dict | None:
+    meta_path = _host_meta_path(repo_path)
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_host_meta(
+    repo_path: Path,
+    host_url: str,
+    mcp_url: str,
+    port: int,
+    *,
+    ui_enabled: bool,
+) -> None:
+    meta_path = _host_meta_path(repo_path)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "pid": os.getpid(),
+        "repo_path": str(repo_path),
+        "host_url": host_url,
+        "mcp_url": mcp_url,
+        "port": port,
+        "ui_enabled": ui_enabled,
+        "leases_dir": str(_host_lease_dir(repo_path)),
+    }
+    meta_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _clear_host_meta(repo_path: Path) -> None:
+    meta_path = _host_meta_path(repo_path)
+    if meta_path.exists():
+        meta_path.unlink(missing_ok=True)
+
+
+def _create_host_lease(repo_path: Path, lease_type: str) -> Path:
+    lease_dir = _host_lease_dir(repo_path)
+    lease_dir.mkdir(parents=True, exist_ok=True)
+    lease_path = lease_dir / f"{os.getpid()}-{uuid.uuid4().hex}.json"
+    payload = {
+        "pid": os.getpid(),
+        "type": lease_type,
+        "created_at": time.time(),
+    }
+    lease_path.write_text(json.dumps(payload), encoding="utf-8")
+    return lease_path
+
+
+def _remove_host_lease(lease_path: Path | None) -> None:
+    if lease_path is not None:
+        lease_path.unlink(missing_ok=True)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _count_live_host_leases(repo_path: Path) -> int:
+    lease_dir = _host_lease_dir(repo_path)
+    if not lease_dir.exists():
+        return 0
+    live = 0
+    for lease_path in lease_dir.glob("*.json"):
+        try:
+            payload = json.loads(lease_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid", 0))
+        except (ValueError, json.JSONDecodeError, OSError):
+            lease_path.unlink(missing_ok=True)
+            continue
+        if _pid_is_alive(pid):
+            live += 1
+        else:
+            lease_path.unlink(missing_ok=True)
+    return live
+
+
+def _is_host_alive(meta: dict, repo_path: Path) -> bool:
+    host_url = meta.get("host_url")
+    if not host_url:
+        return False
+    try:
+        with urllib.request.urlopen(f"{host_url}/api/host", timeout=1.0) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload.get("repoPath") == str(repo_path)
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+def _get_live_host_info(repo_path: Path) -> dict | None:
+    meta = _read_host_meta(repo_path)
+    if meta is None:
+        return None
+    if _is_host_alive(meta, repo_path):
+        return meta
+    return None
+
+
+def _start_host_background(
+    repo_path: Path,
+    *,
+    port: int = DEFAULT_PORT,
+    bind: str = DEFAULT_HOST,
+    watch: bool = True,
+    managed: bool = False,
+) -> None:
+    """Start a detached shared host process in the background."""
+    command = [
+        sys.executable,
+        "-m",
+        "axon.cli.main",
+        "host",
+        "--port",
+        str(port),
+        "--bind",
+        bind,
+        "--no-open",
+    ]
+    if watch:
+        command.append("--watch")
+    else:
+        command.append("--no-watch")
+    if managed:
+        command.append("--managed")
+    with open(os.devnull, "wb") as devnull:
+        subprocess.Popen(  # noqa: S603
+            command,
+            cwd=repo_path,
+            stdout=devnull,
+            stderr=devnull,
+            start_new_session=True,
+        )
+
+
+def _ensure_host_running(
+    repo_path: Path,
+    *,
+    port: int = DEFAULT_PORT,
+    bind: str = DEFAULT_HOST,
+    watch: bool = True,
+    timeout_seconds: float = 10.0,
+    managed: bool = False,
+) -> dict:
+    """Return live host metadata, starting the shared host if necessary."""
+    live_host = _get_live_host_info(repo_path)
+    if live_host is not None:
+        return live_host
+
+    _start_host_background(repo_path, port=port, bind=bind, watch=watch, managed=managed)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        live_host = _get_live_host_info(repo_path)
+        if live_host is not None:
+            return live_host
+        time.sleep(0.2)
+    raise RuntimeError("Timed out waiting for Axon host to start.")
+
+
 app = typer.Typer(
     name="axon",
     help="Axon — Graph-powered code intelligence engine.",
@@ -107,13 +382,13 @@ app = typer.Typer(
 )
 
 def _version_callback(value: bool) -> None:
-    """Print the version and exit."""
     if value:
         console.print(f"Axon v{__version__}")
         raise typer.Exit()
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     version: Optional[bool] = typer.Option(  # noqa: N803
         None,
         "--version",
@@ -124,17 +399,162 @@ def main(
     ),
 ) -> None:
     """Axon — Graph-powered code intelligence engine."""
+    _maybe_notify_update(ctx.invoked_subcommand)
+
+
+def _initialize_writable_storage(repo_path: Path) -> tuple["KuzuBackend", Path, Path]:  # noqa: F821
+    """Open the repo database in read-write mode and ensure the initial index exists."""
+    axon_dir = repo_path / ".axon"
+    axon_dir.mkdir(parents=True, exist_ok=True)
+    db_path = axon_dir / "kuzu"
+
+    storage = KuzuBackend()
+    storage.initialize(db_path)
+
+    if not (axon_dir / "meta.json").exists():
+        console.print("[bold]Running initial index...[/bold]")
+        _, result = run_pipeline(repo_path, storage)
+        meta = _build_meta(result, repo_path)
+        meta_path = axon_dir / "meta.json"
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        try:
+            _register_in_global_registry(meta, repo_path)
+        except Exception:
+            logger.debug("Failed to register repo in global registry", exc_info=True)
+
+    return storage, axon_dir, db_path
+
+
+async def _proxy_stdio_to_http_mcp(mcp_url: str) -> None:
+    """Bridge a local stdio MCP session to the shared HTTP MCP host."""
+    async with stdio_server() as (local_read, local_write):
+        async with streamablehttp_client(mcp_url) as (remote_read, remote_write, _):
+            async def _forward(reader, writer) -> None:
+                async with writer:
+                    async for message in reader:
+                        await writer.send(message)
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_forward, local_read, remote_write)
+                tg.start_soon(_forward, remote_read, local_write)
+
+
+def _run_shared_host(
+    *,
+    port: int,
+    bind: str,
+    no_open: bool,
+    watch: bool,
+    dev: bool,
+    managed: bool,
+    open_browser: bool,
+    announce_ui: bool,
+    announce_mcp: bool,
+    expose_ui: bool,
+    already_running_message: str,
+) -> None:
+    """Run the shared Axon host with configurable UX messaging."""
+    repo_path = Path.cwd().resolve()
+    live_host = _get_live_host_info(repo_path)
+    if live_host is not None:
+        console.print(already_running_message.format(url=live_host["host_url"]))
+        if open_browser and not no_open:
+            webbrowser.open(live_host["host_url"])
+        return
+
+    storage, _, db_path = _initialize_writable_storage(repo_path)
+    host_url, mcp_url = _build_host_urls(bind, port)
+    lock = asyncio.Lock()
+    runtime = AxonRuntime(
+        storage=storage,
+        repo_path=repo_path,
+        watch=watch,
+        lock=lock,
+        host_url=host_url,
+        mcp_url=mcp_url,
+        owns_storage=True,
+    )
+    set_storage(storage)
+    set_lock(lock)
+
+    web_app = web_app_module.create_app(
+        db_path=db_path,
+        repo_path=repo_path,
+        watch=watch,
+        dev=dev,
+        runtime=runtime,
+        mount_mcp=True,
+        host_url=host_url,
+        mcp_url=mcp_url,
+        mount_frontend=expose_ui,
+    )
+
+    if open_browser and not no_open:
+        threading.Timer(1.0, lambda: webbrowser.open(host_url)).start()
+
+    if announce_ui:
+        console.print(f"[bold green]Axon UI[/bold green] running at {host_url}")
+    if announce_mcp:
+        console.print(f"[dim]HTTP MCP endpoint:[/dim] {mcp_url}")
+    if watch:
+        console.print("[dim]File watching enabled[/dim]")
+    if dev:
+        console.print("[dim]Dev mode — proxying to Vite on :5173[/dim]")
+
+    _write_host_meta(repo_path, host_url, mcp_url, port, ui_enabled=expose_ui)
+
+    async def _run() -> None:
+        config = uvicorn.Config(
+            web_app,
+            host=bind,
+            port=port,
+            log_level="warning",
+        )
+        server = uvicorn.Server(config)
+        stop = asyncio.Event()
+
+        async def _serve() -> None:
+            await server.serve()
+            stop.set()
+
+        async def _managed_shutdown() -> None:
+            if not managed:
+                return
+            idle_started_at: float | None = None
+            while not stop.is_set():
+                live_leases = _count_live_host_leases(repo_path)
+                if live_leases == 0:
+                    if idle_started_at is None:
+                        idle_started_at = time.time()
+                    elif time.time() - idle_started_at >= 2.0:
+                        server.should_exit = True
+                        stop.set()
+                        return
+                else:
+                    idle_started_at = None
+                await asyncio.sleep(0.5)
+
+        tasks = [_serve()]
+        if watch:
+            tasks.append(watch_repo(repo_path, storage, stop_event=stop, lock=lock))
+        if managed:
+            tasks.append(_managed_shutdown())
+        await asyncio.gather(*tasks)
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _clear_host_meta(repo_path)
+        storage.close()
 
 @app.command()
 def analyze(
     path: Path = typer.Argument(Path("."), help="Path to the repository to index."),
-    full: bool = typer.Option(False, "--full", help="Perform a full re-index."),
     no_embeddings: bool = typer.Option(False, "--no-embeddings", help="Skip vector embedding generation."),
 ) -> None:
     """Index a repository into a knowledge graph."""
-    from axon.core.ingestion.pipeline import PipelineResult, run_pipeline
-    from axon.core.storage.kuzu_backend import KuzuBackend
-
     repo_path = path.resolve()
     if not repo_path.is_dir():
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
@@ -164,7 +584,6 @@ def analyze(
         _, result = run_pipeline(
             repo_path=repo_path,
             storage=storage,
-            full=full,
             progress_callback=on_progress,
             embeddings=not no_embeddings,
         )
@@ -231,9 +650,7 @@ def status() -> None:
 @app.command(name="list")
 def list_repos() -> None:
     """List all indexed repositories."""
-    from axon.mcp.tools import handle_list_repos
-
-    result = handle_list_repos()
+    result = mcp_tools.handle_list_repos()
     console.print(result)
 
 @app.command()
@@ -265,10 +682,8 @@ def query(
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of results."),
 ) -> None:
     """Search the knowledge graph."""
-    from axon.mcp.tools import handle_query
-
     storage = _load_storage()
-    result = handle_query(storage, q, limit=limit)
+    result = mcp_tools.handle_query(storage, q, limit=limit)
     console.print(result)
     storage.close()
 
@@ -277,10 +692,8 @@ def context(
     name: str = typer.Argument(..., help="Symbol name to inspect."),
 ) -> None:
     """Show 360-degree view of a symbol."""
-    from axon.mcp.tools import handle_context
-
     storage = _load_storage()
-    result = handle_context(storage, name)
+    result = mcp_tools.handle_context(storage, name)
     console.print(result)
     storage.close()
 
@@ -290,20 +703,16 @@ def impact(
     depth: int = typer.Option(3, "--depth", "-d", min=1, max=10, help="Traversal depth (1-10)."),
 ) -> None:
     """Show blast radius of changing a symbol."""
-    from axon.mcp.tools import handle_impact
-
     storage = _load_storage()
-    result = handle_impact(storage, target, depth=depth)
+    result = mcp_tools.handle_impact(storage, target, depth=depth)
     console.print(result)
     storage.close()
 
 @app.command(name="dead-code")
 def dead_code() -> None:
     """List all detected dead code."""
-    from axon.mcp.tools import handle_dead_code
-
     storage = _load_storage()
-    result = handle_dead_code(storage)
+    result = mcp_tools.handle_dead_code(storage)
     console.print(result)
     storage.close()
 
@@ -312,10 +721,8 @@ def cypher(
     query: str = typer.Argument(..., help="Raw Cypher query to execute."),
 ) -> None:
     """Execute raw Cypher against the knowledge graph."""
-    from axon.mcp.tools import handle_cypher
-
     storage = _load_storage()
-    result = handle_cypher(storage, query)
+    result = mcp_tools.handle_cypher(storage, query)
     console.print(result)
     storage.close()
 
@@ -325,30 +732,35 @@ def setup(
     cursor: bool = typer.Option(False, "--cursor", help="Configure MCP for Cursor."),
 ) -> None:
     """Configure MCP for Claude Code / Cursor."""
-    mcp_config = {
+    host_url, mcp_url = _build_host_urls(DEFAULT_HOST, DEFAULT_PORT)
+    hosted_claude_config = {
+        "type": "http",
+        "url": mcp_url,
+    }
+    hosted_cursor_config = {
+        "url": mcp_url,
+    }
+    legacy_stdio_config = {
         "command": "axon",
         "args": ["serve", "--watch"],
     }
 
     if claude or (not claude and not cursor):
         console.print("[bold]Claude Code[/bold]")
-        console.print("Add to .mcp.json in your project root:")
-        console.print(json.dumps({"mcpServers": {"axon": mcp_config}}, indent=2))
-        console.print("\n[dim]Or run: claude mcp add axon -- axon serve --watch[/dim]")
+        console.print(f"Recommended shared-host config (start with `axon host --watch` at {host_url}):")
+        console.print(json.dumps({"mcpServers": {"axon": hosted_claude_config}}, indent=2))
+        console.print("\n[dim]Legacy single-session stdio config:[/dim]")
+        console.print(json.dumps({"mcpServers": {"axon": legacy_stdio_config}}, indent=2))
 
     if cursor or (not claude and not cursor):
         console.print("[bold]Add to your Cursor MCP config:[/bold]")
-        console.print(json.dumps({"axon": mcp_config}, indent=2))
+        console.print(json.dumps({"axon": hosted_cursor_config}, indent=2))
+        console.print("\n[dim]Legacy single-session stdio config:[/dim]")
+        console.print(json.dumps({"axon": legacy_stdio_config}, indent=2))
 
 @app.command()
 def watch() -> None:
     """Watch mode — re-index on file changes."""
-    import asyncio
-
-    from axon.core.ingestion.pipeline import run_pipeline
-    from axon.core.ingestion.watcher import watch_repo
-    from axon.core.storage.kuzu_backend import KuzuBackend
-
     repo_path = Path.cwd().resolve()
     axon_dir = repo_path / ".axon"
     axon_dir.mkdir(parents=True, exist_ok=True)
@@ -359,7 +771,7 @@ def watch() -> None:
 
     if not (axon_dir / "meta.json").exists():
         console.print("[bold]Running initial index...[/bold]")
-        _, result = run_pipeline(repo_path, storage, full=True)
+        _, result = run_pipeline(repo_path, storage)
         meta = _build_meta(result, repo_path)
         meta_path = axon_dir / "meta.json"
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
@@ -382,8 +794,6 @@ def diff(
     branch_range: str = typer.Argument(..., help="Branch range for comparison (e.g. main..feature)."),
 ) -> None:
     """Structural branch comparison."""
-    from axon.core.diff import diff_branches, format_diff
-
     repo_path = Path.cwd().resolve()
     try:
         result = diff_branches(repo_path, branch_range)
@@ -396,84 +806,60 @@ def diff(
 @app.command()
 def mcp() -> None:
     """Start MCP server (stdio transport)."""
-    import asyncio
-
-    from axon.mcp.server import main as mcp_main
-
     asyncio.run(mcp_main())
+
+
+@app.command()
+def host(
+    port: int = typer.Option(DEFAULT_PORT, "--port", "-p", help="Port to serve UI and HTTP MCP on."),
+    bind: str = typer.Option(DEFAULT_HOST, "--bind", help="Host interface to bind the shared host to."),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't auto-open browser."),
+    watch: bool = typer.Option(True, "--watch/--no-watch", help="Enable file watching with auto-reindex."),
+    dev: bool = typer.Option(False, "--dev", help="Proxy to Vite dev server for HMR."),
+    managed: bool = typer.Option(False, "--managed", hidden=True),
+) -> None:
+    """Run the shared Axon host for UI and multi-session HTTP MCP clients."""
+    _run_shared_host(
+        port=port,
+        bind=bind,
+        no_open=no_open,
+        watch=watch,
+        dev=dev,
+        managed=managed,
+        open_browser=True,
+        announce_ui=True,
+        announce_mcp=True,
+        expose_ui=not managed,
+        already_running_message="[yellow]Axon host already running[/yellow] at {url}",
+    )
 
 @app.command()
 def serve(
     watch: bool = typer.Option(False, "--watch", "-w", help="Enable file watching with auto-reindex."),
 ) -> None:
     """Start MCP server, optionally with live file watching."""
-    import asyncio
-    import sys
-
-    from axon.mcp.server import main as mcp_main, set_lock, set_storage
-
     if not watch:
         asyncio.run(mcp_main())
         return
 
-    from axon.core.ingestion.pipeline import run_pipeline
-    from axon.core.ingestion.watcher import watch_repo
-    from axon.core.storage.kuzu_backend import KuzuBackend
-
     repo_path = Path.cwd().resolve()
-    axon_dir = repo_path / ".axon"
-    axon_dir.mkdir(parents=True, exist_ok=True)
-    db_path = axon_dir / "kuzu"
-
-    storage = KuzuBackend()
-    storage.initialize(db_path)
-
-    if not (axon_dir / "meta.json").exists():
-        print("Running initial index...", file=sys.stderr)
-
-        def _stderr_progress(phase: str, pct: float) -> None:
-            if pct == 0.0:
-                print(f"  {phase}...", file=sys.stderr, flush=True)
-
-        _, result = run_pipeline(repo_path, storage, full=True, progress_callback=_stderr_progress)
-
-        meta = _build_meta(result, repo_path)
-        meta_path = axon_dir / "meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-
-        try:
-            _register_in_global_registry(meta, repo_path)
-        except Exception:
-            logger.debug("Failed to register repo in global registry", exc_info=True)
-
-        print("  Index complete.", file=sys.stderr, flush=True)
-
-    lock = asyncio.Lock()
-    set_storage(storage)
-    set_lock(lock)
-
-    async def _run() -> None:
-        from mcp.server.stdio import stdio_server
-        from axon.mcp.server import server as mcp_server
-
-        stop = asyncio.Event()
-
-        async with stdio_server() as (read, write):
-            async def _mcp_then_stop():
-                await mcp_server.run(read, write, mcp_server.create_initialization_options())
-                stop.set()
-
-            await asyncio.gather(
-                _mcp_then_stop(),
-                watch_repo(repo_path, storage, stop_event=stop, lock=lock),
-            )
+    lease_path: Path | None = None
+    try:
+        live_host = _ensure_host_running(
+            repo_path,
+            port=DEFAULT_MANAGED_PORT,
+            watch=True,
+            managed=True,
+        )
+        lease_path = _create_host_lease(repo_path, "mcp")
+    except RuntimeError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        pass
+        asyncio.run(_proxy_stdio_to_http_mcp(live_host["mcp_url"]))
     finally:
-        storage.close()
+        _remove_host_lease(lease_path)
 
 
 @app.command()
@@ -482,11 +868,47 @@ def ui(
     no_open: bool = typer.Option(False, "--no-open", help="Don't auto-open browser."),
     watch_files: bool = typer.Option(False, "--watch", "-w", help="Enable live file watching."),
     dev: bool = typer.Option(False, "--dev", help="Proxy to Vite dev server for HMR."),
+    direct: bool = typer.Option(
+        False,
+        "--direct",
+        help="Force standalone UI mode even if a shared Axon host is already running.",
+    ),
 ) -> None:
     """Launch the Axon web UI."""
-    import uvicorn
-
     repo_path = Path.cwd().resolve()
+    if not direct:
+        live_host = _get_live_host_info(repo_path)
+        if live_host is not None:
+            if live_host.get("ui_enabled", True):
+                console.print(
+                    f"[bold green]Axon UI[/bold green] available at {live_host['host_url']}"
+                )
+            if not no_open:
+                webbrowser.open(live_host["host_url"])
+                return
+
+            proxy_app = web_app_module.create_ui_proxy_app(live_host["host_url"], dev=dev)
+            console.print(f"[bold green]Axon UI[/bold green] running at http://{DEFAULT_HOST}:{port}")
+            if not no_open:
+                webbrowser.open(f"http://{DEFAULT_HOST}:{port}")
+
+            uvicorn.run(proxy_app, host=DEFAULT_HOST, port=port, log_level="warning")
+            return
+        _run_shared_host(
+            port=port,
+            bind=DEFAULT_HOST,
+            no_open=no_open,
+            watch=watch_files,
+            dev=dev,
+            managed=False,
+            open_browser=True,
+            announce_ui=True,
+            announce_mcp=False,
+            expose_ui=True,
+            already_running_message="[bold green]Axon UI[/bold green] available at {url}",
+        )
+        return
+
     db_path = repo_path / ".axon" / "kuzu"
     if not db_path.exists():
         console.print(
@@ -494,14 +916,11 @@ def ui(
         )
         raise typer.Exit(code=1)
 
-    from axon.web.app import create_app
-
-    web_app = create_app(db_path=db_path, repo_path=repo_path, watch=watch_files, dev=dev)
+    web_app = web_app_module.create_app(
+        db_path=db_path, repo_path=repo_path, watch=watch_files, dev=dev,
+    )
 
     if not no_open:
-        import threading
-        import webbrowser
-
         url = f"http://localhost:{port}"
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
@@ -512,10 +931,6 @@ def ui(
         console.print("[dim]Dev mode — proxying to Vite on :5173[/dim]")
 
     if watch_files:
-        import asyncio
-
-        from axon.core.ingestion.watcher import watch_repo
-
         async def _run() -> None:
             config = uvicorn.Config(
                 web_app, host="127.0.0.1", port=port, log_level="warning"
@@ -538,3 +953,7 @@ def ui(
             console.print("\n[bold]UI stopped.[/bold]")
     else:
         uvicorn.run(web_app, host="127.0.0.1", port=port, log_level="warning")
+
+
+if __name__ == "__main__":
+    app()

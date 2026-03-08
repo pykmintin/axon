@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
 
 from axon.core.search.hybrid import hybrid_search
 from axon.core.storage.base import SearchResult
+
 
 @pytest.fixture()
 def mock_storage() -> MagicMock:

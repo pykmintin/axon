@@ -13,9 +13,9 @@ from axon.core.graph.model import (
 from axon.core.ingestion.parser_phase import FileParseData
 from axon.core.ingestion.symbol_lookup import build_name_index
 from axon.core.ingestion.types import process_types
+from axon.core.parsers.base import ParseResult, TypeRef
 
 _TYPE_LABELS = (NodeLabel.CLASS, NodeLabel.INTERFACE, NodeLabel.TYPE_ALIAS)
-from axon.core.parsers.base import ParseResult, TypeRef
 
 
 def _add_file_node(graph: KnowledgeGraph, path: str) -> str:

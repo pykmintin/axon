@@ -8,6 +8,7 @@ from axon.core.graph.model import (
     RelType,
 )
 
+
 def _node(nid: str, label: NodeLabel = NodeLabel.FUNCTION, **kwargs) -> GraphNode:
     """Create a GraphNode with sensible defaults."""
     return GraphNode(
